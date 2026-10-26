@@ -410,7 +410,7 @@ async fn device_manager_retains_failed_detach_and_commits_updates() {
 }
 
 #[tokio::test]
-async fn network_rate_limits() {
+async fn network_rate_limits_and_placeholder_cache() {
     let api = Api::new();
     let dir = tempfile::tempdir().unwrap();
     let mut fc = inner(&api, &dir);
@@ -440,6 +440,27 @@ async fn network_rate_limits() {
         .add_net_device(&NetworkConfig::default(), "net0".into())
         .await
         .is_err());
+    fc.config.boot_info.rootfs_type = "ext4".into();
+    fc.config.blockdev_info.block_device_driver = crate::VM_ROOTFS_DRIVER_MMIO.into();
+    for (set, noflush, cache) in [
+        (false, false, None),
+        (true, false, Some("Writeback")),
+        (true, true, Some("Unsafe")),
+    ] {
+        api.requests.lock().unwrap().clear();
+        fc.config.blockdev_info.block_device_cache_set = set;
+        fc.config.blockdev_info.block_device_cache_noflush = noflush;
+        fc.prepare_vmm_resources().await.unwrap();
+        for (_, _, body) in api
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, path, _)| path.starts_with("/drives/drive"))
+        {
+            assert_eq!(body.get("cache_type").and_then(Value::as_str), cache);
+        }
+    }
 }
 
 struct CountLogs(Arc<AtomicUsize>);

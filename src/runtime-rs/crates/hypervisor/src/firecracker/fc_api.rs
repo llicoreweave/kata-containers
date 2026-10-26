@@ -164,12 +164,20 @@ impl FcInner {
                 false => abs_path.clone(),
                 true => rel_path.clone(),
             };
-            let body = json!({
+            let mut body = json!({
                 "drive_id": format!("drive{}",i),
                 "path_on_host": format!("{}/drive{}", path_on_host, i),
                 "is_root_device": false,
                 "is_read_only": false
             });
+            if self.config.blockdev_info.block_device_cache_set {
+                body["cache_type"] =
+                    json!(if self.config.blockdev_info.block_device_cache_noflush {
+                        "Unsafe"
+                    } else {
+                        "Writeback"
+                    });
+            }
 
             self.request_with_retry(Method::PUT, &format!("/drives/drive{i}"), body.to_string())
                 .await?;
