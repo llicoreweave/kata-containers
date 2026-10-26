@@ -26,8 +26,16 @@ use tokio::{fs, fs::File};
 const REQUEST_RETRY: u32 = 500;
 const FC_KERNEL: &str = "vmlinux";
 const FC_ROOT_FS: &str = "rootfs";
+pub(super) const DISK_POOL_SIZE: u32 = 6;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Firecracker API returned {status}: {body}")]
+struct ApiError {
+    status: hyper::StatusCode,
+    body: String,
+}
+
 const DRIVE_PREFIX: &str = "drive";
-const DISK_POOL_SIZE: u32 = 6;
 
 impl FcInner {
     pub(crate) fn get_resource(&self, src: &str, dst: &str) -> Result<String> {
@@ -56,9 +64,9 @@ impl FcInner {
     // execute from there
     pub(crate) async fn remount_jailer_with_exec(&self) -> Result<()> {
         let localpath = [self.vm_path.clone(), ROOT.to_string()].join("/");
-        let _ = fs::create_dir_all(&localpath)
+        fs::create_dir_all(&localpath)
             .await
-            .context(format!("failed to create directory {:?}", localpath));
+            .context(format!("failed to create directory {:?}", localpath))?;
         mount::bind_mount_unchecked(&localpath, &localpath, false, MsFlags::MS_SHARED)
             .context("bind mount jailer root")?;
 
@@ -252,6 +260,7 @@ impl FcInner {
         debug!(sl(), "METHOD: {:?}", method.clone());
         debug!(sl(), "URI: {:?}", uri.clone());
         debug!(sl(), "DATA: {:?}", data.clone());
+        let mut last_error = None;
         for _count in 0..REQUEST_RETRY {
             let req = Request::builder()
                 .method(method.clone())
@@ -260,22 +269,28 @@ impl FcInner {
                 .header("Content-Type", "application/json")
                 .body(Full::new(Bytes::from(data.clone())))?;
 
-            match self.send_request(req).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), self.send_request(req))
+                .await
+                .context("Firecracker API request timed out")?
+            {
                 Ok(resp) => {
                     debug!(sl(), "Request sent, resp: {:?}", resp);
                     return Ok(());
                 }
                 Err(resp) => {
                     debug!(sl(), "Request sent with error, resp: {:?}", resp);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    // API validation failures are permanent, and must reach callers.
+                    if !resp.is::<hyper_util::client::legacy::Error>() {
+                        return Err(resp);
+                    }
+                    last_error = Some(resp);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
             }
         }
-        Err(anyhow::anyhow!(
-            "After {} attempts, it still doesn't work.",
-            REQUEST_RETRY
-        ))
+        Err(last_error.unwrap_or_else(|| anyhow!("Firecracker request was not attempted")))
+            .with_context(|| format!("Firecracker API unavailable after {REQUEST_RETRY} attempts"))
     }
 
     pub(crate) async fn send_request(
@@ -288,47 +303,25 @@ impl FcInner {
         debug!(sl(), "Request RESPONSE {:?} {:?}", &status, resp);
         if status.is_success() {
             return Ok(resp);
-        } else {
-            let body = resp.into_body().collect().await?.to_bytes();
-            if body.is_empty() {
-                debug!(sl(), "Request FAILED WITH STATUS: {:?}", status);
-                None
-            } else {
-                let body = String::from_utf8_lossy(&body).into_owned();
-                debug!(
-                    sl(),
-                    "Request FAILED WITH STATUS: {:?} and BODY: {:?}", status, body
-                );
-                Some(body)
-            };
         }
-
-        Err(anyhow::anyhow!(
-            "After {} attempts, it
-                            still doesn't work.",
-            REQUEST_RETRY
-        ))
+        let body = resp.into_body().collect().await?.to_bytes();
+        Err(ApiError {
+            status,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
+        .into())
     }
-    pub(crate) fn cleanup_resource(&self) {
+    pub(crate) fn cleanup_resource(&self) -> Result<()> {
         if self.jailed {
-            self.umount_jail_resource(FC_KERNEL).ok();
-            self.umount_jail_resource(FC_ROOT_FS).ok();
-
-            for i in 1..DISK_POOL_SIZE {
-                self.umount_jail_resource(&[DRIVE_PREFIX, &i.to_string()].concat())
-                    .ok();
+            for name in [FC_KERNEL, FC_ROOT_FS, ""] {
+                self.umount_jail_resource(name)?;
             }
-
-            self.umount_jail_resource("").ok();
         }
-        std::fs::remove_dir_all(self.vm_path.as_str())
-            .inspect_err(|err| {
-                error!(
-                    sl(),
-                    "failed to remove dir all for {} with error: {:?}", &self.vm_path, &err
-                )
-            })
-            .ok();
+        match std::fs::remove_dir_all(&self.vm_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove Firecracker VM directory"),
+        }
     }
 
     pub(crate) fn umount_jail_resource(&self, jailed_path: &str) -> Result<()> {
@@ -344,7 +337,9 @@ impl FcInner {
             ]
             .join("/"),
         };
-        nix::mount::umount2(path.as_str(), nix::mount::MntFlags::MNT_DETACH)
-            .with_context(|| format!("umount path {}", path))
+        match nix::mount::umount(path.as_str()) {
+            Ok(()) | Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("umount path {path}")),
+        }
     }
 }

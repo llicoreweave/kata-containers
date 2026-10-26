@@ -8,8 +8,7 @@ use crate::{VcpuThreadIds, VmmState, HYPERVISOR_FIRECRACKER};
 use anyhow::{anyhow, Context, Result};
 use kata_types::capabilities::Capabilities;
 use kata_types::config::KATA_PATH;
-use std::collections::HashSet;
-use std::iter::FromIterator;
+use std::time::Duration;
 use tokio::fs;
 
 pub const FC_API_SOCKET_NAME: &str = "fc.sock";
@@ -27,6 +26,12 @@ impl FcInner {
     ) -> Result<()> {
         debug!(sl(), "Preparing Firecracker");
 
+        if self.check_process().is_ok() {
+            return Err(anyhow!("Firecracker is already running"));
+        }
+        if id.is_empty() || id.contains('/') || id == "." || id == ".." {
+            return Err(anyhow!("invalid Firecracker sandbox ID"));
+        }
         self.id = id.to_string();
 
         if !self.config.jailer_path.is_empty() {
@@ -43,7 +48,6 @@ impl FcInner {
             debug!(sl(), "VM Path: {:?}", self.vm_path);
             self.run_dir = [self.vm_path.clone(), "root".to_string(), "run".to_string()].join("/");
             debug!(sl(), "Rundir: {:?}", self.run_dir);
-            let _ = self.remount_jailer_with_exec().await;
         } else {
             self.vm_path = [KATA_PATH.to_string(), id.to_string()].join("/");
             debug!(sl(), "VM Path: {:?}", self.vm_path);
@@ -55,69 +59,113 @@ impl FcInner {
         self.asock_path = [self.run_dir.as_str(), "fc.sock"].join("/");
         debug!(sl(), "Socket Path: {:?}", self.asock_path);
 
-        let _ = fs::create_dir_all(self.run_dir.as_str())
-            .await
-            .context(format!("failed to create directory {:?}", self.vm_path));
-
         self.netns = _netns.clone();
 
         self.config.set_selinux_label(selinux_label);
 
-        self.prepare_vmm(self.netns.clone()).await?;
-        self.state = VmmState::VmmServerReady;
-        self.prepare_vmm_resources().await?;
-        self.prepare_hvsock().await?;
+        let result = async {
+            if self.jailed {
+                self.remount_jailer_with_exec().await?;
+            }
+            fs::create_dir_all(self.run_dir.as_str())
+                .await
+                .context("create Firecracker run directory")?;
+            self.prepare_vmm(self.netns.clone()).await?;
+            self.state = VmmState::VmmServerReady;
+            self.prepare_vmm_resources().await?;
+            self.prepare_hvsock().await?;
+
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let stop = self.stop_vm().await;
+            if let Err(stop_error) = stop {
+                return Err(error).context(format!(
+                    "Firecracker preparation failed; process cleanup also failed: {stop_error:#}"
+                ));
+            }
+            self.cleanup().await.with_context(|| {
+                format!("Firecracker preparation failed: {error:#}; cleanup also failed")
+            })?;
+            self.state = VmmState::NotReady;
+            return Err(error).context("prepare Firecracker VM");
+        }
         Ok(())
     }
 
     pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
         debug!(sl(), "Starting sandbox");
+        if self.state != VmmState::VmmServerReady {
+            return Err(anyhow!("Firecracker VMM is not prepared for VM start"));
+        }
+        self.check_process()?;
         let body: String = serde_json::json!({
             "action_type": "InstanceStart"
         })
         .to_string();
-        self.request_with_retry(hyper::Method::PUT, "/actions", body)
-            .await?;
+        if let Err(error) = self
+            .request_with_retry(hyper::Method::PUT, "/actions", body)
+            .await
+        {
+            self.stop_vm().await.with_context(|| {
+                format!("Firecracker VM start failed: {error:#}; process cleanup also failed")
+            })?;
+            self.cleanup().await.with_context(|| {
+                format!("Firecracker VM start failed: {error:#}; resource cleanup also failed")
+            })?;
+            return Err(error).context("start Firecracker VM");
+        }
         self.state = VmmState::VmRunning;
         Ok(())
     }
 
     pub(crate) async fn stop_vm(&mut self) -> Result<()> {
-        debug!(sl(), "Stopping sandbox");
-        if self.state != VmmState::VmRunning {
-            debug!(sl(), "VM not running!");
-        } else {
-            let mut fc_process = self.fc_process.lock().await;
-            if let Some(fc_process) = fc_process.as_mut() {
-                if fc_process.id().is_some() {
-                    info!(sl!(), "FcInner::stop_vm(): kill()'ing fc");
-                    return fc_process.kill().await.map_err(anyhow::Error::from);
-                } else {
-                    info!(
-                        sl!(),
-                        "FcInner::stop_vm(): fc process isn't running (likely stopped already)"
-                    );
-                }
+        let result = async {
+            let mut child = self.fc_process.lock().await;
+            if let Some(child) = child.as_mut() {
+                child.kill().await.context("kill Firecracker")
+            } else if !self.vmm_exited()? {
+                self.signal_process(self.check_process()?)?;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !self.vmm_exited()? {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    anyhow::Ok(())
+                })
+                .await
+                .context("wait for recovered Firecracker to exit")?
             } else {
-                info!(
-                    sl!(),
-                    "FcInner::stop_vm(): fc process isn't running (likely stopped already)"
-                );
+                Ok(())
             }
         }
-
+        .await;
+        result?;
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.recovery_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(sender) = &self.exit_notify {
+            let _ = sender.try_send(());
+        }
+        self.state = VmmState::NotReady;
         Ok(())
     }
 
     pub(crate) async fn wait_vm(&self) -> Result<i32> {
-        let mut fc_process = self.fc_process.lock().await;
-
-        if let Some(mut fc_process) = fc_process.take() {
-            let status = fc_process.wait().await?;
-            Ok(status.code().unwrap_or(0))
-        } else {
-            Err(anyhow!("the process has been reaped"))
+        let mut child = self.fc_process.lock().await;
+        if let Some(mut child) = child.take() {
+            return Ok(child.wait().await?.code().unwrap_or(0));
         }
+        // A restored VMM is not this shim's child and cannot be waitpid'd.
+        while self.check_process().is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(0)
     }
 
     pub(crate) fn pause_vm(&self) -> Result<()> {
@@ -144,55 +192,47 @@ impl FcInner {
     }
 
     pub(crate) async fn disconnect(&mut self) {
-        warn!(sl(), "Disconnect: Not implemented");
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.recovery_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
     pub(crate) async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
-        debug!(sl(), "Get Thread IDs");
-        Ok(VcpuThreadIds::default())
+        self.vcpu_threads()
     }
 
     pub(crate) async fn get_pids(&self) -> Result<Vec<u32>> {
-        debug!(sl(), "Get PIDs");
-        let mut pids = HashSet::new();
-        // get shim thread ids
-        pids.insert(self.pid.unwrap());
-
-        debug!(sl(), "PIDs: {:?}", pids);
-        Ok(Vec::from_iter(pids))
+        Ok(vec![self.check_process()?])
     }
 
     pub(crate) async fn get_vmm_master_tid(&self) -> Result<u32> {
-        debug!(sl(), "Get VMM master TID");
-        if let Some(pid) = self.pid {
-            Ok(pid)
-        } else {
-            Err(anyhow!("could not get vmm master tid"))
-        }
+        self.check_process()
     }
     pub(crate) async fn get_ns_path(&self) -> Result<String> {
-        debug!(sl(), "Get NS path");
-        if let Some(pid) = self.pid {
-            let ns_path = format!("/proc/{pid}/ns");
-            Ok(ns_path)
-        } else {
-            Err(anyhow!("could not get ns path"))
-        }
+        let pid = self.check_process()?;
+        Ok(format!("/proc/{pid}/ns"))
     }
 
-    pub(crate) async fn cleanup(&self) -> Result<()> {
-        debug!(sl(), "Cleanup");
-        self.cleanup_resource();
-
-        std::fs::remove_dir_all(self.vm_path.as_str())
-            .inspect_err(|err| {
-                error!(
-                    sl(),
-                    "failed to remove dir all for {} with error: {:?}", &self.vm_path, &err
-                )
-            })
-            .ok();
-
+    pub(crate) async fn prepare_for_cleanup(&mut self) -> Result<()> {
+        // Generic sandbox setup can fail after prepare_vm spawned the API
+        // server but before InstanceStart was attempted. Reap that server too.
+        if self.state == VmmState::VmmServerReady {
+            self.stop_vm().await?;
+        }
+        if !self.vmm_exited()? {
+            return Err(anyhow!("cannot clean up a running Firecracker process"));
+        }
+        self.state = VmmState::NotReady;
         Ok(())
+    }
+
+    pub(crate) async fn cleanup(&mut self) -> Result<()> {
+        self.prepare_for_cleanup().await?;
+        self.cleanup_resource()
     }
 
     pub(crate) async fn resize_vcpu(&self, old_vcpu: u32, new_vcpu: u32) -> Result<(u32, u32)> {
@@ -201,8 +241,7 @@ impl FcInner {
     }
 
     pub(crate) async fn check(&self) -> Result<()> {
-        warn!(sl(), "Check: Not implemented");
-        Ok(())
+        self.check_process().map(|_| ())
     }
 
     pub(crate) async fn get_jailer_root(&self) -> Result<String> {
@@ -220,7 +259,6 @@ impl FcInner {
         Ok(String::new())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

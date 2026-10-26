@@ -153,7 +153,7 @@ impl Hypervisor for Firecracker {
     }
 
     async fn cleanup(&self) -> Result<()> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.cleanup().await
     }
 

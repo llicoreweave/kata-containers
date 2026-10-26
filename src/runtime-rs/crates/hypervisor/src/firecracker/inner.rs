@@ -3,7 +3,7 @@
 //
 //SPDX-License-Identifier: Apache-2.0
 
-use crate::firecracker::{inner_hypervisor::FC_API_SOCKET_NAME, sl};
+use crate::firecracker::{inner_hypervisor::FC_API_SOCKET_NAME, process, sl};
 use crate::MemoryConfig;
 use crate::HYPERVISOR_FIRECRACKER;
 use crate::{device::DeviceType, VmmState};
@@ -26,6 +26,7 @@ use tokio::io::BufReader;
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 unsafe impl Send for FcInner {}
 unsafe impl Sync for FcInner {}
@@ -37,6 +38,9 @@ pub struct FcInner {
     pub(crate) state: VmmState,
     pub(crate) config: HypervisorConfig,
     pub(crate) pid: Option<u32>,
+    pub(super) process_start_time: Option<u64>,
+    pub(super) stderr_task: Option<JoinHandle<Result<()>>>,
+    pub(super) recovery_task: Option<JoinHandle<()>>,
     pub(crate) vm_path: String,
     pub(crate) netns: Option<String>,
     pub(crate) client: Client<UnixConnector, Full<Bytes>>,
@@ -52,7 +56,8 @@ pub struct FcInner {
 impl FcInner {
     pub fn new(exit_notify: mpsc::Sender<()>) -> FcInner {
         let mut capabilities = Capabilities::new();
-        capabilities.set(CapabilityBits::BlockDeviceSupport);
+        capabilities
+            .set(CapabilityBits::BlockDeviceSupport | CapabilityBits::BlockDeviceHotplugSupport);
 
         FcInner {
             id: String::default(),
@@ -60,6 +65,9 @@ impl FcInner {
             state: VmmState::NotReady,
             config: Default::default(),
             pid: None,
+            process_start_time: None,
+            stderr_task: None,
+            recovery_task: None,
             netns: None,
             vm_path: String::default(),
             client: Client::unix(),
@@ -75,6 +83,12 @@ impl FcInner {
 
     pub(crate) async fn prepare_vmm(&mut self, netns: Option<String>) -> Result<()> {
         self.validate_version().await?;
+        let exit_notify = self.exit_notify.clone().context("no exit notify")?;
+        let netns_file = netns
+            .as_ref()
+            .map(std::fs::File::open)
+            .transpose()
+            .context("open Firecracker network namespace")?;
         let mut cmd: Command;
         self.netns = netns.clone();
         match self.jailed {
@@ -119,10 +133,8 @@ impl FcInner {
         // Make sure we're in the correct Network Namespace
         unsafe {
             let _pre = cmd.pre_exec(move || {
-                if let Some(netns_path) = &netns {
-                    debug!(sl(), "set netns for vmm master {:?}", &netns_path);
-                    let netns_fd = std::fs::File::open(netns_path);
-                    let _ = setns(&netns_fd?, CloneFlags::CLONE_NEWNET).context("set netns failed");
+                if let Some(netns_file) = &netns_file {
+                    setns(netns_file, CloneFlags::CLONE_NEWNET).map_err(std::io::Error::from)?;
                 }
                 Ok(())
             });
@@ -133,12 +145,8 @@ impl FcInner {
             .spawn()
             .context("spawn Firecracker")?;
 
-        let stderr = child.stderr.take().unwrap();
-        let exit_notify = self
-            .exit_notify
-            .take()
-            .ok_or_else(|| anyhow!("no exit notify"))?;
-        tokio::spawn(log_fc_stderr(stderr, exit_notify));
+        let stderr = child.stderr.take().context("missing Firecracker stderr")?;
+        self.stderr_task = Some(tokio::spawn(log_fc_stderr(stderr)));
 
         match child.id() {
             Some(id) => {
@@ -148,6 +156,13 @@ impl FcInner {
                     "VMM spawned successfully: PID: {:?}, current TID: {:?}", id, cur_tid
                 );
                 self.pid = Some(id);
+                match process::process_start_time(id) {
+                    Ok(start) => self.process_start_time = Some(start),
+                    Err(error) => {
+                        let _ = child.kill().await;
+                        return Err(error);
+                    }
+                }
             }
             None => {
                 let exit_status = child.wait().await?;
@@ -156,7 +171,13 @@ impl FcInner {
             }
         };
 
-        self.fc_process = Mutex::new(Some(child));
+        *self.fc_process.lock().await = Some(child);
+        self.recovery_task = Some(process::monitor_process(
+            self.pid.context("missing Firecracker PID")?,
+            self.process_start_time
+                .context("missing Firecracker start time")?,
+            exit_notify,
+        ));
 
         Ok(())
     }
@@ -201,7 +222,7 @@ impl FcInner {
     }
 }
 
-async fn log_fc_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Result<()> {
+async fn log_fc_stderr(stderr: ChildStderr) -> Result<()> {
     info!(sl!(), "starting reading fc stderr");
 
     let stderr_reader = BufReader::new(stderr);
@@ -215,9 +236,6 @@ async fn log_fc_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Re
         info!(sl!(), "fc stderr: {:?}", buffer);
     }
 
-    // Notfiy the waiter the process exit.
-    let _ = exit_notify.try_send(());
-
     info!(sl!(), "finished reading fc stderr");
     Ok(())
 }
@@ -226,7 +244,6 @@ async fn log_fc_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Re
 impl Persist for FcInner {
     type State = HypervisorState;
     type ConstructorArgs = mpsc::Sender<()>;
-
     async fn save(&self) -> Result<Self::State> {
         Ok(HypervisorState {
             hypervisor_type: HYPERVISOR_FIRECRACKER.to_string(),
@@ -240,23 +257,26 @@ impl Persist for FcInner {
             ..Default::default()
         })
     }
-    async fn restore(exit_notify: mpsc::Sender<()>, hypervisor_state: Self::State) -> Result<Self> {
-        Ok(FcInner {
-            id: hypervisor_state.id,
-            asock_path: String::default(),
-            state: VmmState::NotReady,
-            vm_path: hypervisor_state.vm_path,
-            config: hypervisor_state.config,
-            netns: hypervisor_state.netns,
-            pid: None,
-            jailed: hypervisor_state.jailed,
-            jailer_root: hypervisor_state.jailer_root,
-            client: Client::unix(),
-            pending_devices: vec![],
-            run_dir: hypervisor_state.run_dir,
-            capabilities: Capabilities::new(),
-            fc_process: Mutex::new(None),
-            exit_notify: Some(exit_notify),
-        })
+    async fn restore(exit_notify: mpsc::Sender<()>, state: Self::State) -> Result<Self> {
+        let mut inner = Self::new(exit_notify);
+        inner.id = state.id;
+        inner.config = state.config;
+        inner.vm_path = state.vm_path;
+        inner.netns = state.netns;
+        inner.jailed = state.jailed;
+        inner.jailer_root = state.jailer_root;
+        inner.run_dir = state.run_dir;
+        Ok(inner)
+    }
+}
+
+impl Drop for FcInner {
+    fn drop(&mut self) {
+        if let Some(task) = &self.stderr_task {
+            task.abort();
+        }
+        if let Some(task) = &self.recovery_task {
+            task.abort();
+        }
     }
 }

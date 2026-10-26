@@ -265,7 +265,7 @@ impl ResourceManagerInner {
         // tokio runtime, and block the task on it.
         let device_manager = self.device_manager.clone();
         let network = thread::spawn(move || -> Result<Arc<dyn Network>> {
-            let rt = runtime::Builder::new_current_thread().enable_io().build()?;
+            let rt = network_runtime()?;
             let d = rt
                 .block_on(network::new(&network_config, device_manager))
                 .context("new network")?;
@@ -1443,14 +1443,43 @@ fn block_device_node_is_readonly(major: i64, minor: i64) -> bool {
     })
 }
 
+// Hypervisor network attachment uses bounded API requests and retries. The
+// namespace-local runtime must support their timers as well as I/O.
+fn network_runtime() -> Result<runtime::Runtime> {
+    Ok(runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::device_cgroup_access_is_readonly;
+    use super::{device_cgroup_access_is_readonly, network_runtime};
     use oci_spec::runtime::{
         Linux, LinuxBuilder, LinuxDeviceCgroup, LinuxDeviceCgroupBuilder, LinuxDeviceType,
         LinuxResourcesBuilder,
     };
     use rstest::rstest;
+
+    #[test]
+    fn network_runtime_bounds_stalled_api_io() -> anyhow::Result<()> {
+        network_runtime()?.block_on(async {
+            use tokio::{io::AsyncReadExt, net::TcpListener, net::TcpStream};
+
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let mut client = TcpStream::connect(listener.local_addr()?).await?;
+            // Keep the API peer connected without returning a response.
+            let (_peer, _) = listener.accept().await?;
+            let mut response = [0u8; 1];
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                client.read_exact(&mut response)
+            )
+            .await
+            .is_err());
+            anyhow::Ok(())
+        })
+    }
 
     const MAJOR: i64 = 8;
     const MINOR: i64 = 0;

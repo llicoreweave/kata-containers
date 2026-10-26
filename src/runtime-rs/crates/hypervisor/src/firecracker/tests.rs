@@ -62,3 +62,36 @@ async fn configured_binary_version_errors() {
         .to_string()
         .contains("minimum"));
 }
+
+#[tokio::test]
+async fn process_health_and_vcpu_threads() {
+    let mut fc = FcInner::new(mpsc::channel(1).0);
+    assert!(fc.check().await.is_err());
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    fc.pid = Some(pid);
+    fc.process_start_time = Some(process::process_start_time(pid).unwrap());
+    fc.check().await.unwrap();
+    assert_eq!(fc.get_pids().await.unwrap(), vec![pid]);
+    child.kill().await.unwrap();
+    assert!(fc.check().await.is_err());
+    let (ready, received) = std::sync::mpsc::channel();
+    let (finish, done) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("fc_vcpu 3".into())
+        .spawn(move || {
+            ready.send(nix::unistd::gettid().as_raw() as u32).unwrap();
+            done.recv().unwrap();
+        })
+        .unwrap();
+    let tid = received.recv().unwrap();
+    fc.pid = Some(std::process::id());
+    fc.process_start_time = Some(process::process_start_time(std::process::id()).unwrap());
+    assert_eq!(fc.get_thread_ids().await.unwrap().vcpus.get(&3), Some(&tid));
+    finish.send(()).unwrap();
+    thread.join().unwrap();
+}
