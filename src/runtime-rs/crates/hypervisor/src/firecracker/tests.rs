@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Kata Contributors
 // SPDX-License-Identifier: Apache-2.0
 use super::diagnostics::LOG_FIFO;
+use super::diagnostics::METRICS_FIFO;
 use super::{process, FcInner};
 use crate::VmmState;
 use serde_json::Value;
@@ -220,26 +221,46 @@ async fn real_fifo_consumption_prometheus_and_reader_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let mut fc = inner(&api, &dir);
     fc.prepare_diagnostics(false).await.unwrap();
+    let metrics_path = dir.path().join(METRICS_FIFO);
+    let mut metrics = OpenOptions::new().write(true).open(&metrics_path).unwrap();
     let mut logs = OpenOptions::new()
         .write(true)
         .open(dir.path().join(LOG_FIFO))
         .unwrap();
     logs.write_all(b"first VMM log\nsecond VMM log\n").unwrap();
+    metrics
+        .write_all(b"{\"block\":{\"read_count\":7},")
+        .unwrap();
+    metrics
+        .write_all(b"\"vcpu\":{\"exit_io_in\":3}}\nnot-json\n")
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while count.load(Ordering::SeqCst) != 2 {
+        loop {
+            if fc
+                .get_hypervisor_metrics()
+                .await
+                .unwrap()
+                .contains("kata_firecracker_block{item=\"read_count\"} 7")
+                && count.load(Ordering::SeqCst) == 2
+            {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
+    drop(metrics);
     drop(logs);
     fc.diagnostics.stop().await;
     let fds: Vec<_> = std::fs::read_dir("/proc/self/fd")
         .unwrap()
         .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
         .collect();
+    assert!(!fds.contains(&metrics_path));
     assert!(!fds.contains(&dir.path().join(LOG_FIFO)));
     assert_eq!(api.requests.lock().unwrap()[0].1, "/logger");
+    assert_eq!(api.requests.lock().unwrap()[1].1, "/metrics");
 }
 
 #[tokio::test]

@@ -3029,6 +3029,7 @@ dependencies = [
  "path-clean",
  "pcilibs-rs",
  "persist",
+ "prometheus",
  "protobuf",
  "protocols",
  "qapi",

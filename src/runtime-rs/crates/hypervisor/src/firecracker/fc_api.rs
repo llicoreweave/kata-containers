@@ -313,7 +313,13 @@ impl FcInner {
     }
     pub(crate) fn cleanup_resource(&self) -> Result<()> {
         if self.jailed {
-            for name in [super::diagnostics::LOG_FIFO, FC_KERNEL, FC_ROOT_FS, ""] {
+            for name in [
+                super::diagnostics::LOG_FIFO,
+                super::diagnostics::METRICS_FIFO,
+                FC_KERNEL,
+                FC_ROOT_FS,
+                "",
+            ] {
                 self.umount_jail_resource(name)?;
             }
         }
