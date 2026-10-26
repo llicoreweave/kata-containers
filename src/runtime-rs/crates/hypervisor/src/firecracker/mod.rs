@@ -148,9 +148,23 @@ impl Hypervisor for Firecracker {
         inner.hypervisor_config()
     }
 
+    async fn block_device_start_index(&self) -> u64 {
+        1
+    }
+    fn block_device_update_supported(&self) -> bool {
+        true
+    }
+    fn manages_boot_image(&self) -> bool {
+        true
+    }
+
     async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
         let inner = self.inner.read().await;
         inner.get_thread_ids().await
+    }
+
+    async fn prepare_for_cleanup(&self) -> Result<()> {
+        self.inner.write().await.prepare_for_cleanup().await
     }
 
     async fn cleanup(&self) -> Result<()> {

@@ -75,7 +75,11 @@ impl FcInner {
             self.state = VmmState::VmmServerReady;
             self.prepare_vmm_resources().await?;
             self.prepare_hvsock().await?;
-
+            while !self.pending_devices.is_empty() {
+                let device = self.pending_devices[0].clone();
+                self.add_device(device).await?;
+                self.pending_devices.remove(0);
+            }
             anyhow::Ok(())
         }
         .await;

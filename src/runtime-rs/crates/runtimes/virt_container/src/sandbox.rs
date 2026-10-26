@@ -918,6 +918,9 @@ impl VirtSandbox {
     }
 
     async fn prepare_rootfs_config(&self) -> Result<Option<BlockConfigModern>> {
+        if self.hypervisor.manages_boot_image() {
+            return Ok(None);
+        }
         let boot_info = self.hypervisor.hypervisor_config().await.boot_info;
         let security_info = self.hypervisor.hypervisor_config().await.security_info;
 
@@ -1692,7 +1695,7 @@ impl Sandbox for VirtSandbox {
 
         info!(sl!(), "begin stop sandbox");
         if !vmm_start_attempted {
-            // Start failed before start_vm(), so there is no VMM to stop.
+            // InstanceStart was not attempted; cleanup preparation reaps any prepared VMM.
             self.record_stop(0, SystemTime::now(), true).await;
             info!(sl!(), "sandbox stopped before VM start");
             return Ok(());
@@ -1785,6 +1788,13 @@ impl Sandbox for VirtSandbox {
         if steps.hypervisor && steps.resources && steps.netns && steps.rootless_runtime_dir {
             return Ok(());
         }
+
+        // Firecracker starts its API server during prepare_vm. Stop it before
+        // network/block cleanup, even when InstanceStart was never attempted.
+        self.hypervisor
+            .prepare_for_cleanup()
+            .await
+            .context("prepare hypervisor for resource cleanup")?;
 
         let rootless_uid = self
             .hypervisor

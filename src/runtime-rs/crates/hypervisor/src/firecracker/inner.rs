@@ -22,6 +22,7 @@ use kata_types::{
 };
 use nix::sched::{setns, CloneFlags};
 use persist::sandbox_persist::Persist;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -41,6 +42,8 @@ pub struct FcInner {
     pub(crate) config: HypervisorConfig,
     pub(crate) pid: Option<u32>,
     pub(super) process_start_time: Option<u64>,
+    pub(super) attached_drives: BTreeMap<u64, String>,
+    pub(super) retired_mounts: BTreeSet<String>,
     pub(super) diagnostics: Diagnostics,
     pub(super) stderr_task: Option<JoinHandle<Result<()>>>,
     pub(super) recovery_task: Option<JoinHandle<()>>,
@@ -69,6 +72,8 @@ impl FcInner {
             config: Default::default(),
             pid: None,
             process_start_time: None,
+            attached_drives: BTreeMap::new(),
+            retired_mounts: BTreeSet::new(),
             diagnostics: Diagnostics::default(),
             stderr_task: None,
             recovery_task: None,

@@ -5,7 +5,7 @@
 //
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -40,9 +40,10 @@ macro_rules! declare_index {
         let current_index = if let Some(index) = $self.$released_index.pop() {
             index
         } else {
-            $self.$index
+            let index = $self.$index;
+            $self.$index += 1;
+            index
         };
-        $self.$index += 1;
         Ok(current_index)
     }};
 }
@@ -102,6 +103,8 @@ impl SharedInfo {
 #[derive(Debug)]
 pub struct DeviceManager {
     devices: HashMap<String, ArcMutexDevice>,
+    failed_attachments: HashSet<String>,
+    uncertain_updates: HashSet<String>,
     hypervisor: Arc<dyn Hypervisor>,
     shared_info: SharedInfo,
     pcie_topology: Option<PCIeTopology>,
@@ -113,10 +116,15 @@ impl DeviceManager {
         topo_config: Option<&TopologyConfigInfo>,
     ) -> Result<Self> {
         let devices = HashMap::<String, ArcMutexDevice>::new();
+        let mut shared_info = SharedInfo::new().await;
+        // Firecracker installs its guest image as the first virtio-mmio disk.
+        shared_info.block_index = hypervisor.block_device_start_index().await;
         Ok(DeviceManager {
             devices,
+            failed_attachments: HashSet::new(),
+            uncertain_updates: HashSet::new(),
             hypervisor,
-            shared_info: SharedInfo::new().await,
+            shared_info,
             pcie_topology: PCIeTopology::new(topo_config),
         })
     }
@@ -146,6 +154,12 @@ impl DeviceManager {
     }
 
     async fn try_add_device(&mut self, device_id: &str) -> Result<()> {
+        if self.failed_attachments.contains(device_id) || self.uncertain_updates.contains(device_id)
+        {
+            return Err(anyhow!(
+                "block device {device_id} requires reconciliation before reuse"
+            ));
+        }
         // find the device
         let device = self
             .devices
@@ -153,12 +167,27 @@ impl DeviceManager {
             .context("failed to find device")?;
 
         let mut device_guard = device.lock().await;
+        let first_block_attachment = match device_guard.get_device_info().await {
+            DeviceType::BlockModern(block) => block.lock().await.attach_count == 0,
+            _ => false,
+        };
+        if first_block_attachment {
+            // Record ownership before the first cancellable backend request.
+            self.failed_attachments.insert(device_id.to_owned());
+        }
         // attach device
         let result = device_guard
             .attach(&mut self.pcie_topology.as_mut(), self.hypervisor.as_ref())
             .await;
         // handle attach error
         if let Err(e) = result {
+            if e.is::<crate::BlockAttachmentUncertain>() {
+                // The handle retains a reference for a later confirmed detach.
+                // Never return its index to the allocator while the VMM may
+                // still be using it.
+                self.failed_attachments.insert(device_id.to_owned());
+                return Err(e);
+            }
             match device_guard.get_device_info().await {
                 DeviceType::Vfio(device) => {
                     // safe here:
@@ -187,10 +216,15 @@ impl DeviceManager {
 
             drop(device_guard);
             self.devices.remove(device_id);
+            self.failed_attachments.remove(device_id);
+            self.uncertain_updates.remove(device_id);
 
             return Err(e);
         }
 
+        if first_block_attachment {
+            self.failed_attachments.remove(device_id);
+        }
         Ok(())
     }
 
@@ -201,9 +235,33 @@ impl DeviceManager {
             // Snapshot all state needed after detach before changing the reference count.
             let device_info = device_guard.get_device_info().await;
             let (still_in_use, is_pmem) = detach_metadata(&device_info).await;
-            let index = device_guard
-                .detach(&mut self.pcie_topology.as_mut(), self.hypervisor.as_ref())
-                .await?;
+            let never_attached = if self.failed_attachments.contains(device_id) {
+                match &device_info {
+                    DeviceType::BlockModern(block) => {
+                        let block = block.lock().await;
+                        (block.attach_count == 0).then_some(block.config.index)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if !still_in_use
+                && never_attached.is_none()
+                && matches!(&device_info, DeviceType::BlockModern(_))
+            {
+                // A failed or cancelled final detach may already have PATCHed
+                // the placeholder. Do not share the old backing until retry.
+                self.uncertain_updates.insert(device_id.to_owned());
+            }
+            let index = match never_attached {
+                Some(index) => Some(index),
+                None => {
+                    device_guard
+                        .detach(&mut self.pcie_topology.as_mut(), self.hypervisor.as_ref())
+                        .await?
+                }
+            };
 
             // If it's still in use, it should be just skipped.
             if still_in_use {
@@ -217,6 +275,8 @@ impl DeviceManager {
             drop(device_guard);
             self.devices.remove(device_id);
 
+            self.failed_attachments.remove(device_id);
+            self.uncertain_updates.remove(device_id);
             return Ok(());
         }
 
@@ -310,6 +370,14 @@ impl DeviceManager {
     }
 
     async fn new_device(&mut self, device_config: &DeviceConfig) -> Result<String> {
+        // Failed callers did not receive a device ID. Reconcile their retained
+        // handles here so successful retries can reclaim slots. A busy backing
+        // keeps its index reserved while unrelated devices may use other slots.
+        for id in self.failed_attachments.clone() {
+            if let Err(error) = self.try_remove_device(&id).await {
+                warn!(sl!(), "failed to reconcile block attachment"; "device_id" => id, "error" => error.to_string());
+            }
+        }
         // device ID must be generated by manager instead of device itself
         // in case of ID collision
         let device_id = self.new_device_id()?;
@@ -317,6 +385,14 @@ impl DeviceManager {
             DeviceConfig::BlockCfgModern(config) => {
                 if let Some(device_matched_id) = self.find_device(config.path_on_host.clone()).await
                 {
+                    if self.failed_attachments.contains(&device_matched_id)
+                        || self.uncertain_updates.contains(&device_matched_id)
+                    {
+                        return Err(anyhow!(
+                            "previous block attachment for {} still requires cleanup",
+                            config.path_on_host
+                        ));
+                    }
                     return Ok(device_matched_id);
                 }
 
@@ -551,6 +627,51 @@ impl DeviceManager {
     }
 
     async fn try_update_device(&mut self, updated_config: &DeviceConfig) -> Result<()> {
+        if let DeviceConfig::BlockCfgModern(config) = updated_config {
+            if !self.hypervisor.block_device_update_supported() {
+                return Err(anyhow!("hypervisor does not support block backing updates"));
+            }
+            for (device_id, device) in &self.devices {
+                let DeviceType::BlockModern(block) = device.lock().await.get_device_info().await
+                else {
+                    continue;
+                };
+                let original = block.lock().await.clone();
+                if original.config.index != config.index {
+                    continue;
+                }
+                if config.path_on_host.is_empty() {
+                    return Err(anyhow!("updated block backing path is empty"));
+                }
+                // Preserve the slot, guest address and reference count. Commit
+                // the new backing path after the hypervisor completes its update.
+                let mut candidate = original;
+                candidate.config.path_on_host = config.path_on_host.clone();
+                candidate.config.is_readonly = config.is_readonly;
+                let updated = candidate.config.clone();
+                let already_uncertain = !self.uncertain_updates.insert(device_id.clone());
+                if let Err(error) = self
+                    .hypervisor
+                    .update_device(DeviceType::BlockModern(Arc::new(Mutex::new(candidate))))
+                    .await
+                {
+                    if !already_uncertain && !error.is::<crate::BlockAttachmentUncertain>() {
+                        self.uncertain_updates.remove(device_id);
+                    }
+                    // An uncertain result or cancellation keeps this handle
+                    // blocked. It has live users, so only an explicit update
+                    // or final detach may reconcile it.
+                    return Err(error);
+                }
+                block.lock().await.config = updated;
+                self.uncertain_updates.remove(device_id);
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "no matching block device at index {}",
+                config.index
+            ));
+        }
         let device_id = match updated_config {
             DeviceConfig::ShareFsCfg(config) => {
                 // Try to find the sharefs device.
@@ -617,22 +738,20 @@ pub async fn do_handle_device(
     d: &RwLock<DeviceManager>,
     dev_info: &DeviceConfig,
 ) -> Result<DeviceType> {
-    let device_id = d
-        .write()
-        .await
+    // Keep lookup, attachment and the returned snapshot atomic with respect
+    // to failed-attachment reconciliation, updates and removals.
+    let mut manager = d.write().await;
+    let device_id = manager
         .new_device(dev_info)
         .await
         .context("failed to create device")?;
 
-    d.write()
-        .await
+    manager
         .try_add_device(&device_id)
         .await
         .context("failed to add device")?;
 
-    let device_info = d
-        .read()
-        .await
+    let device_info = manager
         .get_device_info(&device_id)
         .await
         .context("failed to get device info")?;
@@ -760,6 +879,18 @@ mod tests {
         assert_eq!(dm.network_queue_pairs(8).await, 8);
         assert_eq!(dm.network_queue_pairs(256).await, 256);
         assert_eq!(dm.network_queue_pairs(512).await, 256);
+    }
+
+    #[tokio::test]
+    async fn released_index_does_not_advance_fresh_index() {
+        let mut shared = super::SharedInfo::new().await;
+        assert_eq!(shared.declare_device_index(false).unwrap(), 0);
+        for _ in 0..32 {
+            shared.release_device_index(0, false);
+            assert_eq!(shared.declare_device_index(false).unwrap(), 0);
+        }
+        assert_eq!(shared.declare_device_index(false).unwrap(), 1);
+        assert_eq!(shared.declare_device_index(false).unwrap(), 2);
     }
 
     async fn new_device_manager() -> Result<Arc<RwLock<DeviceManager>>> {

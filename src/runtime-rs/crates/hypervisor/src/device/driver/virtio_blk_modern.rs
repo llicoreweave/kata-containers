@@ -202,7 +202,9 @@ impl Device for BlockDeviceModernHandle {
 
         if let Err(e) = h.add_device(DeviceType::BlockModern(self.arc())).await {
             error!(sl!(), "failed to attach block device: {:?}", e);
-            self.decrease_attach_count().await?;
+            if !e.is::<crate::BlockAttachmentUncertain>() {
+                self.decrease_attach_count().await?;
+            }
 
             return Err(e);
         }
@@ -215,24 +217,31 @@ impl Device for BlockDeviceModernHandle {
         _pcie_topo: &mut Option<&mut PCIeTopology>,
         h: &dyn hypervisor,
     ) -> Result<Option<u64>> {
-        // get the count of device detached, skip detach once it reaches the 0
-        if self
-            .decrease_attach_count()
-            .await
-            .context("failed to decrease attach count")?
         {
-            return Ok(None);
+            let mut device = self.inner.lock().await;
+            if device.attach_count > 1 {
+                do_decrease_count(&mut device.attach_count)?;
+                return Ok(None);
+            }
+            if device.attach_count == 0 {
+                return Err(anyhow::anyhow!("block device is not attached"));
+            }
         }
-        if let Err(e) = h.remove_device(DeviceType::BlockModern(self.arc())).await {
-            self.increase_attach_count().await?;
-            return Err(e);
-        }
-        Ok(Some(self.snapshot_config().await.index))
+        // Retain the final reference through a cancellable backend detach.
+        // Cancellation must leave enough ownership to retry the operation.
+        h.remove_device(DeviceType::BlockModern(self.arc())).await?;
+        let mut device = self.inner.lock().await;
+        do_decrease_count(&mut device.attach_count)?;
+        Ok(Some(device.config.index))
     }
 
-    async fn update(&mut self, _h: &dyn hypervisor) -> Result<()> {
-        // There's no need to do update for virtio-blk
-        Ok(())
+    async fn update(&mut self, h: &dyn hypervisor) -> Result<()> {
+        if !h.block_device_update_supported() {
+            return Err(anyhow::anyhow!(
+                "hypervisor does not support block backing updates"
+            ));
+        }
+        h.update_device(DeviceType::BlockModern(self.arc())).await
     }
 
     async fn get_device_info(&self) -> DeviceType {

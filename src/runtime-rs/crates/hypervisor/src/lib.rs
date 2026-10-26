@@ -133,6 +133,14 @@ pub struct MemoryConfig {
     pub probe: bool,
 }
 
+/// The caller must retain the device and its index until detach confirms that
+/// the VMM no longer holds the backing storage.
+#[derive(Debug, thiserror::Error)]
+#[error("block attachment at index {index} is uncertain; cleanup is required")]
+pub(crate) struct BlockAttachmentUncertain {
+    pub index: u64,
+}
+
 #[async_trait]
 pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     // vm manager
@@ -161,6 +169,18 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn get_agent_socket(&self) -> Result<String>;
     async fn disconnect(&self);
     async fn hypervisor_config(&self) -> HypervisorConfig;
+    /// First block index available to containers after backend boot devices.
+    async fn block_device_start_index(&self) -> u64 {
+        0
+    }
+    fn block_device_update_supported(&self) -> bool {
+        false
+    }
+    /// Whether this backend configures boot_info.image itself during prepare_vm.
+    /// The sandbox must not attach that image again through the device manager.
+    fn manages_boot_image(&self) -> bool {
+        false
+    }
     /// Queue-pair limit applied before endpoint creation.
     /// Backends may override this with a stricter limit.
     async fn network_queue_limit(&self) -> usize {
@@ -170,6 +190,11 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn get_pids(&self) -> Result<Vec<u32>>;
     async fn get_vmm_master_tid(&self) -> Result<u32>;
     async fn get_ns_path(&self) -> Result<String>;
+    /// Finish any backend preparation that must precede host resource teardown.
+    /// A backend that starts a process in prepare_vm must confirm its exit here.
+    async fn prepare_for_cleanup(&self) -> Result<()> {
+        Ok(())
+    }
     async fn cleanup(&self) -> Result<()>;
     async fn check(&self) -> Result<()>;
     async fn get_jailer_root(&self) -> Result<String>;
