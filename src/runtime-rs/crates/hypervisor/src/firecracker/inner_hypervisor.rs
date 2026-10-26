@@ -71,6 +71,7 @@ impl FcInner {
                 .await
                 .context("create Firecracker run directory")?;
             self.prepare_vmm(self.netns.clone()).await?;
+            self.prepare_diagnostics(false).await?;
             self.state = VmmState::VmmServerReady;
             self.prepare_vmm_resources().await?;
             self.prepare_hvsock().await?;
@@ -141,6 +142,7 @@ impl FcInner {
         }
         .await;
         result?;
+        self.diagnostics.stop().await;
         if let Some(task) = self.stderr_task.take() {
             task.abort();
             let _ = task.await;
@@ -192,6 +194,7 @@ impl FcInner {
     }
 
     pub(crate) async fn disconnect(&mut self) {
+        self.diagnostics.stop().await;
         if let Some(task) = self.stderr_task.take() {
             task.abort();
             let _ = task.await;
@@ -232,6 +235,7 @@ impl FcInner {
 
     pub(crate) async fn cleanup(&mut self) -> Result<()> {
         self.prepare_for_cleanup().await?;
+        self.diagnostics.stop().await;
         self.cleanup_resource()
     }
 

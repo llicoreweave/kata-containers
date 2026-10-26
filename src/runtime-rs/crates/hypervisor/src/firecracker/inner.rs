@@ -3,7 +3,9 @@
 //
 //SPDX-License-Identifier: Apache-2.0
 
-use crate::firecracker::{inner_hypervisor::FC_API_SOCKET_NAME, process, sl};
+use crate::firecracker::{
+    diagnostics::Diagnostics, inner_hypervisor::FC_API_SOCKET_NAME, process, sl,
+};
 use crate::MemoryConfig;
 use crate::HYPERVISOR_FIRECRACKER;
 use crate::{device::DeviceType, VmmState};
@@ -39,6 +41,7 @@ pub struct FcInner {
     pub(crate) config: HypervisorConfig,
     pub(crate) pid: Option<u32>,
     pub(super) process_start_time: Option<u64>,
+    pub(super) diagnostics: Diagnostics,
     pub(super) stderr_task: Option<JoinHandle<Result<()>>>,
     pub(super) recovery_task: Option<JoinHandle<()>>,
     pub(crate) vm_path: String,
@@ -66,6 +69,7 @@ impl FcInner {
             config: Default::default(),
             pid: None,
             process_start_time: None,
+            diagnostics: Diagnostics::default(),
             stderr_task: None,
             recovery_task: None,
             netns: None,
