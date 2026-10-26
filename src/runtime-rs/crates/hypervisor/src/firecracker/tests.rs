@@ -409,6 +409,39 @@ async fn device_manager_retains_failed_detach_and_commits_updates() {
     assert_eq!(fc.block_device_start_index().await, 1);
 }
 
+#[tokio::test]
+async fn network_rate_limits() {
+    let api = Api::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut fc = inner(&api, &dir);
+    fc.add_net_device(&NetworkConfig::default(), "net0".into())
+        .await
+        .unwrap();
+    assert!(api
+        .requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .2
+        .get("rx_rate_limiter")
+        .is_none());
+    fc.config.network_info.rx_rate_limiter_max_rate = 80_000_000;
+    fc.config.network_info.tx_rate_limiter_max_rate = 8_000;
+    fc.add_net_device(&NetworkConfig::default(), "net0".into())
+        .await
+        .unwrap();
+    let body = api.requests.lock().unwrap().last().unwrap().2.clone();
+    assert_eq!(body["rx_rate_limiter"]["bandwidth"]["size"], 10_485_760);
+    assert_eq!(body["tx_rate_limiter"]["bandwidth"]["size"], 1024);
+    assert_eq!(body["rx_rate_limiter"]["bandwidth"]["refill_time"], 1000);
+    fc.config.network_info.rx_rate_limiter_max_rate = 1;
+    assert!(fc
+        .add_net_device(&NetworkConfig::default(), "net0".into())
+        .await
+        .is_err());
+}
+
 struct CountLogs(Arc<AtomicUsize>);
 impl slog::Drain for CountLogs {
     type Ok = ();

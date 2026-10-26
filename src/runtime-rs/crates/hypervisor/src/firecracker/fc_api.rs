@@ -423,17 +423,29 @@ impl FcInner {
             Some(mac) => MacAddr::from_bytes(&mac.0).ok(),
             None => None,
         };
-        let body: String = json!({
+        let mut body = json!({
             "iface_id": &device_id,
             "guest_mac": g_mac,
             "host_dev_name": &config.host_dev_name
-
-        })
-        .to_string();
+        });
+        for (key, rate) in [
+            (
+                "rx_rate_limiter",
+                self.config.network_info.rx_rate_limiter_max_rate,
+            ),
+            (
+                "tx_rate_limiter",
+                self.config.network_info.tx_rate_limiter_max_rate,
+            ),
+        ] {
+            if let Some(rate) = network_rate_limiter(rate)? {
+                body[key] = rate;
+            }
+        }
         self.request_with_retry(
             Method::PUT,
             &["/network-interfaces/", &device_id].concat(),
-            body,
+            body.to_string(),
         )
         .await?;
         Ok(())
@@ -578,4 +590,29 @@ impl FcInner {
             Err(error) => Err(error).with_context(|| format!("umount path {path}")),
         }
     }
+}
+
+// Go's RevertBytes conversion, applied after bits/sec -> bytes/sec.
+fn network_rate_limiter(bits: u64) -> Result<Option<serde_json::Value>> {
+    if bits == 0 {
+        return Ok(None);
+    }
+    fn revert(num: u64) -> Option<u64> {
+        if num < 1000 {
+            Some(num)
+        } else {
+            revert(num / 1000)?
+                .checked_mul(1024)?
+                .checked_add(num % 1000)
+        }
+    }
+    let size = revert(bits / 8).context("Firecracker network rate limit overflows")?;
+    if size == 0 {
+        return Err(anyhow!(
+            "Firecracker network rate limit must be at least 8 bits/sec"
+        ));
+    }
+    Ok(Some(
+        json!({"bandwidth": {"size": size, "refill_time": 1000}}),
+    ))
 }
