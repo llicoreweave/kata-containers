@@ -6,6 +6,7 @@
 use crate::firecracker::{
     diagnostics::Diagnostics, inner_hypervisor::FC_API_SOCKET_NAME, process, sl,
 };
+use crate::hypervisor_persist::FirecrackerState;
 use crate::MemoryConfig;
 use crate::HYPERVISOR_FIRECRACKER;
 use crate::{device::DeviceType, VmmState};
@@ -253,9 +254,22 @@ async fn log_fc_stderr(stderr: ChildStderr) -> Result<()> {
 impl Persist for FcInner {
     type State = HypervisorState;
     type ConstructorArgs = mpsc::Sender<()>;
+
     async fn save(&self) -> Result<Self::State> {
+        self.check_process()?;
         Ok(HypervisorState {
             hypervisor_type: HYPERVISOR_FIRECRACKER.to_string(),
+            pid: self.pid.map(|pid| pid as i32),
+            api_socket: self.asock_path.clone(),
+            firecracker: Some(FirecrackerState {
+                process_start_time: self
+                    .process_start_time
+                    .context("cannot save Firecracker without process identity")?,
+                boot_id: process::boot_id()?,
+                running: self.state == VmmState::VmRunning,
+                attached_drives: self.attached_drives.clone(),
+                retired_mounts: self.retired_mounts.clone(),
+            }),
             id: self.id.clone(),
             vm_path: self.vm_path.clone(),
             config: self.hypervisor_config(),
@@ -266,15 +280,91 @@ impl Persist for FcInner {
             ..Default::default()
         })
     }
-    async fn restore(exit_notify: mpsc::Sender<()>, state: Self::State) -> Result<Self> {
-        let mut inner = Self::new(exit_notify);
-        inner.id = state.id;
-        inner.config = state.config;
-        inner.vm_path = state.vm_path;
-        inner.netns = state.netns;
-        inner.jailed = state.jailed;
-        inner.jailer_root = state.jailer_root;
-        inner.run_dir = state.run_dir;
+    async fn restore(exit_notify: mpsc::Sender<()>, hypervisor_state: Self::State) -> Result<Self> {
+        Self::restore_state(exit_notify, hypervisor_state, false).await
+    }
+}
+
+impl FcInner {
+    pub(super) async fn restore_for_cleanup(
+        exit_notify: mpsc::Sender<()>,
+        state: HypervisorState,
+    ) -> Result<Self> {
+        Self::restore_state(exit_notify, state, true).await
+    }
+
+    async fn restore_state(
+        exit_notify: mpsc::Sender<()>,
+        hypervisor_state: HypervisorState,
+        cleanup_only: bool,
+    ) -> Result<Self> {
+        let saved = hypervisor_state
+            .firecracker
+            .context("saved Firecracker state lacks process recovery metadata")?;
+        let pid = hypervisor_state
+            .pid
+            .filter(|pid| *pid > 0)
+            .context("saved Firecracker state has no valid PID")? as u32;
+        let same_boot = saved.boot_id == process::boot_id()?;
+        let identity = if same_boot {
+            process::process_identity(pid)?
+        } else {
+            None
+        };
+        let live = match identity {
+            Some(start) if start == saved.process_start_time => true,
+            Some(_) => {
+                return Err(anyhow!(
+                    "saved Firecracker process identity no longer matches PID {pid}"
+                ))
+            }
+            None if cleanup_only => false,
+            None => {
+                return Err(anyhow!(
+                    "saved Firecracker process {pid} is missing or exited"
+                ))
+            }
+        };
+        let mut inner = Self::new(exit_notify.clone());
+        inner.id = hypervisor_state.id;
+        inner.asock_path = hypervisor_state.api_socket;
+        if live && !cleanup_only && inner.asock_path.is_empty() {
+            return Err(anyhow!("saved Firecracker state has no API socket"));
+        }
+        inner.state = if !live {
+            VmmState::NotReady
+        } else if saved.running {
+            VmmState::VmRunning
+        } else {
+            VmmState::VmmServerReady
+        };
+        inner.vm_path = hypervisor_state.vm_path;
+        inner.config = hypervisor_state.config;
+        inner.netns = hypervisor_state.netns;
+        inner.pid = live.then_some(pid);
+        inner.process_start_time = live.then_some(saved.process_start_time);
+        inner.attached_drives = saved.attached_drives;
+        inner.retired_mounts = saved.retired_mounts;
+        inner.jailed = hypervisor_state.jailed;
+        inner.jailer_root = hypervisor_state.jailer_root;
+        inner.run_dir = hypervisor_state.run_dir;
+        if live {
+            if !cleanup_only {
+                inner
+                    .prepare_diagnostics(true)
+                    .await
+                    .context("recover Firecracker FIFO readers")?;
+            }
+            inner.recovery_task = Some(process::monitor_process(
+                pid,
+                saved.process_start_time,
+                exit_notify,
+            ));
+        } else {
+            // Cleanup restores metadata, not an unrelated/recycled process.
+            // Do not open FIFOs or retain a PID that could later be reused.
+            let _ = exit_notify.try_send(());
+        }
         Ok(inner)
     }
 }

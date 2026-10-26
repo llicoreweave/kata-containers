@@ -59,6 +59,12 @@ pub(super) fn process_identity(pid: u32) -> Result<Option<u64>> {
         .context("invalid process start time")
 }
 
+pub(super) fn boot_id() -> Result<String> {
+    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned())
+}
+
 impl FcInner {
     pub(super) fn vmm_exited(&self) -> Result<bool> {
         let Some(pid) = self.pid else { return Ok(true) };

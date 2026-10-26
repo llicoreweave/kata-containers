@@ -313,7 +313,9 @@ impl RuntimeHandlerManager {
         // the config plugins here before loading the sandbox configuration.
         init_runtime_handlers()?;
 
-        let config = if let Ok(spec) = load_oci_spec() {
+        let config = if let Some(config) = sandbox_state.cleanup_config() {
+            config
+        } else if let Ok(spec) = load_oci_spec() {
             let annotations = spec.annotations().clone().unwrap_or_default();
             load_config(&annotations, &None).context("load config")?
         } else {
@@ -324,6 +326,7 @@ impl RuntimeHandlerManager {
             sid: inner.id.clone(),
             toml_config: config,
             sender,
+            cleanup_only: true,
         };
         match sandbox_state.sandbox_type.clone() {
             #[cfg(feature = "linux")]

@@ -6,7 +6,18 @@
 
 use crate::HypervisorConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+/// Process recovery metadata, distinct from a guest snapshot.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FirecrackerState {
+    pub process_start_time: u64,
+    pub boot_id: String,
+    pub running: bool,
+    /// Slot to jailed backing mount name. Placeholders are never overmounted.
+    pub attached_drives: BTreeMap<u64, String>,
+    pub retired_mounts: BTreeSet<String>,
+}
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct HypervisorState {
     // Type of hypervisor, E.g. dragonball/qemu/firecracker.
@@ -33,4 +44,6 @@ pub struct HypervisorState {
     pub cached_block_devices: HashSet<String>,
     pub virtiofs_daemon_pid: i32,
     pub passfd_listener_port: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecracker: Option<FirecrackerState>,
 }

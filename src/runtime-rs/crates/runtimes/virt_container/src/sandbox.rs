@@ -115,6 +115,7 @@ pub struct SandboxRestoreArgs {
     pub sid: String,
     pub toml_config: TomlConfig,
     pub sender: Sender<Message>,
+    pub cleanup_only: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Display)]
@@ -1695,7 +1696,8 @@ impl Sandbox for VirtSandbox {
 
         info!(sl!(), "begin stop sandbox");
         if !vmm_start_attempted {
-            // InstanceStart was not attempted; cleanup preparation reaps any prepared VMM.
+            // InstanceStart was not attempted. A backend process spawned during
+            // prepare_vm is reaped by prepare_for_cleanup before host teardown.
             self.record_stop(0, SystemTime::now(), true).await;
             info!(sl!(), "sandbox stopped before VM start");
             return Ok(());
@@ -2051,6 +2053,7 @@ impl Persist for VirtSandbox {
             sandbox_type: VIRTCONTAINER.to_string(),
             resource: Some(self.resource_manager.save().await?),
             vmm_exit_confirmed: self.vmm_exit_confirmed.is_cancelled(),
+            runtime_config: Some(self.resource_manager.config().await.runtime.clone()),
             hypervisor: match hypervisor_state.hypervisor_type.as_str() {
                 #[cfg(all(
                     feature = "dragonball",
@@ -2077,16 +2080,11 @@ impl Persist for VirtSandbox {
                 )),
             }?,
         };
-        // FIXME: properly handle jailed case
-        // eg: Determine if we are running jailed:
-        // let h = sandbox_state.hypervisor.clone().unwrap_or_default();
-        // Figure out the jailed path:
-        // jailed_path = h.<>
-        // and somehow store the sandbox state into the jail:
-        // persist::to_disk(&sandbox_state, &self.sid, jailed_path)?;
-        // Issue is, how to handle restore.
         let h = sandbox_state.hypervisor.as_ref().unwrap();
-        let vmpath = match h.jailed {
+        // The separate shim delete process reads /run/kata/<sid>/state.json.
+        // Firecracker's jail is /run/kata/firecracker/<sid>/root, so storing its
+        // checkpoint inside that jail made the cleanup path unable to find it.
+        let vmpath = match h.jailed && h.hypervisor_type != hypervisor::HYPERVISOR_FIRECRACKER {
             true => h.vm_path.clone(),
             false => "".to_string(),
         };
@@ -2121,8 +2119,12 @@ impl Persist for VirtSandbox {
             }
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             HYPERVISOR_FIRECRACKER => {
-                let hypervisor =
-                    Arc::new(Firecracker::restore((), h).await?) as Arc<dyn Hypervisor>;
+                let firecracker = if sandbox_args.cleanup_only {
+                    Firecracker::restore_for_cleanup(h).await?
+                } else {
+                    Firecracker::restore((), h).await?
+                };
+                let hypervisor = Arc::new(firecracker) as Arc<dyn Hypervisor>;
                 Ok(hypervisor)
             }
             HYPERVISOR_QEMU => {

@@ -1,24 +1,34 @@
 // Copyright (c) 2026 Kata Contributors
 // SPDX-License-Identifier: Apache-2.0
-use super::diagnostics::LOG_FIFO;
-use super::diagnostics::METRICS_FIFO;
-use super::{process, FcInner};
-use crate::{
-    device::DeviceType, BlockConfigModern, BlockDeviceModernHandle, NetworkConfig, VmmState,
-};
-use serde_json::Value;
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
+
+use persist::sandbox_persist::Persist;
+use serde_json::Value;
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixListener,
+    sync::mpsc,
+    task::JoinHandle,
+};
+
+use super::{
+    diagnostics::{LOG_FIFO, METRICS_FIFO},
+    process, FcInner,
+};
+use crate::{
+    device::DeviceType, BlockConfigModern, BlockDeviceModernHandle, HypervisorState, NetworkConfig,
+    VmmState,
+};
 
 type Requests = Arc<Mutex<Vec<(String, String, Value)>>>;
 
@@ -531,6 +541,71 @@ async fn real_fifo_consumption_prometheus_and_reader_shutdown() {
 }
 
 #[tokio::test]
+async fn health_threads_and_process_recovery() {
+    let api = Api::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut fc = inner(&api, &dir);
+    assert!(fc.check().await.is_err());
+    assert!(fc.get_pids().await.is_err());
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    fc.pid = Some(pid);
+    fc.process_start_time = Some(process::process_start_time(pid).unwrap());
+    fc.state = VmmState::VmRunning;
+    fc.prepare_diagnostics(false).await.unwrap();
+    fc.check().await.unwrap();
+    assert_eq!(fc.get_pids().await.unwrap(), vec![pid]);
+    let saved = fc.save().await.unwrap();
+    let serialized = serde_json::to_string(&saved).unwrap();
+    assert_eq!(saved.pid, Some(pid as i32));
+    fc.disconnect().await;
+    drop(fc);
+    let (notify, mut exited) = mpsc::channel(1);
+    let mut recovered = FcInner::restore(notify, serde_json::from_str(&serialized).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(recovered.state, VmmState::VmRunning);
+    assert_eq!(recovered.asock_path, api.path);
+    recovered.check().await.unwrap();
+    let mut wrong = saved.clone();
+    wrong.firecracker.as_mut().unwrap().process_start_time += 1;
+    assert!(FcInner::restore(mpsc::channel(1).0, wrong).await.is_err());
+    child.kill().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), exited.recv())
+        .await
+        .unwrap();
+    assert!(recovered.check().await.is_err());
+    assert!(FcInner::restore(mpsc::channel(1).0, saved).await.is_err());
+    recovered.stop_vm().await.unwrap();
+    assert!(
+        FcInner::restore(mpsc::channel(1).0, HypervisorState::default())
+            .await
+            .is_err()
+    );
+
+    let (ready, received) = std::sync::mpsc::channel();
+    let (finish, done) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("fc_vcpu 3".into())
+        .spawn(move || {
+            ready.send(nix::unistd::gettid().as_raw() as u32).unwrap();
+            done.recv().unwrap();
+        })
+        .unwrap();
+    let tid = received.recv().unwrap();
+    let mut fc = inner(&api, &dir);
+    fc.pid = Some(std::process::id());
+    fc.process_start_time = Some(process::process_start_time(std::process::id()).unwrap());
+    assert_eq!(fc.get_thread_ids().await.unwrap().vcpus.get(&3), Some(&tid));
+    finish.send(()).unwrap();
+    thread.join().unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires a privileged container for real bind mounts"]
 async fn jailed_mount_rollback_detach_and_update() {
     let api = Api::new();
@@ -716,6 +791,87 @@ async fn uncertain_attach_keeps_manager_ownership_until_reconciled() {
 }
 
 #[tokio::test]
+async fn cleanup_restore_accepts_dead_vmm_without_opening_fifos() {
+    use crate::Hypervisor;
+    let api = Api::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut fc = inner(&api, &dir);
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    fc.pid = Some(pid);
+    fc.process_start_time = Some(process::process_start_time(pid).unwrap());
+    fc.state = VmmState::VmRunning;
+    let mut saved = fc.save().await.unwrap();
+    child.kill().await.unwrap();
+    // No FIFO exists, and an API socket is unnecessary for cleanup of a dead VMM.
+    saved.api_socket.clear();
+    assert!(super::Firecracker::restore((), saved.clone())
+        .await
+        .is_err());
+    let recovered = super::Firecracker::restore_for_cleanup(saved)
+        .await
+        .unwrap();
+    assert_eq!(recovered.inner.read().await.state, VmmState::NotReady);
+    assert!(recovered.inner.read().await.pid.is_none());
+    assert!(recovered.get_pids().await.is_err());
+    tokio::time::timeout(Duration::from_secs(1), recovered.wait_vm())
+        .await
+        .unwrap()
+        .unwrap();
+    recovered.stop_vm().await.unwrap();
+    recovered.cleanup().await.unwrap();
+    assert!(!dir.path().exists());
+}
+
+#[tokio::test]
+async fn cleanup_restore_checks_live_identity_without_requiring_fifos() {
+    use crate::Hypervisor;
+    let api = Api::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut fc = inner(&api, &dir);
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    fc.pid = Some(pid);
+    fc.process_start_time = Some(process::process_start_time(pid).unwrap());
+    fc.state = VmmState::VmRunning;
+    let saved = fc.save().await.unwrap();
+    let mut wrong = saved.clone();
+    wrong.firecracker.as_mut().unwrap().process_start_time += 1;
+    assert!(super::Firecracker::restore_for_cleanup(wrong)
+        .await
+        .is_err());
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "a reused PID must not be signalled"
+    );
+    assert!(
+        super::Firecracker::restore((), saved.clone())
+            .await
+            .is_err(),
+        "live recovery requires FIFOs"
+    );
+    let recovered = super::Firecracker::restore_for_cleanup(saved)
+        .await
+        .unwrap();
+    assert!(
+        recovered.cleanup().await.is_err(),
+        "live VMM cleanup must stay guarded"
+    );
+    recovered.stop_vm().await.unwrap();
+    child.wait().await.unwrap();
+    recovered.cleanup().await.unwrap();
+    assert!(!dir.path().exists());
+}
+
+#[tokio::test]
 #[ignore = "requires a privileged container for real bind mounts"]
 async fn jailed_uncertain_update_detaches_before_reaping_backings() {
     let api = Api::new();
@@ -785,6 +941,41 @@ async fn jailed_block_removal_after_stop_retries_busy_mounts_without_api() {
     assert!(!mount.exists());
     assert!(fc.attached_drives.is_empty());
     fc.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a privileged container for real bind mounts"]
+async fn jailed_cleanup_restore_releases_dead_vmm_mounts() {
+    use crate::Hypervisor;
+    let api = Api::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut fc = inner(&api, &dir);
+    fc.jailed = true;
+    let original = dir.path().join("original");
+    std::fs::write(&original, b"original").unwrap();
+    std::fs::write(dir.path().join("root/drive1"), b"").unwrap();
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    fc.pid = Some(pid);
+    fc.process_start_time = Some(process::process_start_time(pid).unwrap());
+    fc.state = VmmState::VmRunning;
+    let saved = fc.save().await.unwrap();
+    fc.add_device(block(1, original.to_str().unwrap()))
+        .await
+        .unwrap();
+    child.kill().await.unwrap();
+    api.status.store(500, Ordering::SeqCst);
+    let requests = api.requests.lock().unwrap().len();
+    let recovered = super::Firecracker::restore_for_cleanup(saved)
+        .await
+        .unwrap();
+    recovered.cleanup().await.unwrap();
+    assert_eq!(requests, api.requests.lock().unwrap().len());
+    assert!(!dir.path().exists());
 }
 
 #[tokio::test]
@@ -1180,12 +1371,10 @@ async fn cancelled_block_request_preserves_ownership(update: bool, jailed: bool)
 async fn cancelled_attach_requires_reconciliation() {
     cancelled_block_request_preserves_ownership(false, false).await;
 }
-
 #[tokio::test]
 async fn cancelled_update_requires_reconciliation() {
     cancelled_block_request_preserves_ownership(true, false).await;
 }
-
 #[tokio::test]
 #[ignore = "requires a privileged container for real bind mounts"]
 async fn jailed_cancelled_requests_preserve_backing_mounts() {
@@ -1268,37 +1457,4 @@ async fn cancelled_detach_retains_final_reference_for_retry() {
         .try_remove_device(&next.device_id)
         .await
         .unwrap();
-}
-
-#[tokio::test]
-async fn process_health_and_vcpu_threads() {
-    let mut fc = FcInner::new(mpsc::channel(1).0);
-    assert!(fc.check().await.is_err());
-    let mut child = tokio::process::Command::new("sleep")
-        .arg("60")
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let pid = child.id().unwrap();
-    fc.pid = Some(pid);
-    fc.process_start_time = Some(process::process_start_time(pid).unwrap());
-    fc.check().await.unwrap();
-    assert_eq!(fc.get_pids().await.unwrap(), vec![pid]);
-    child.kill().await.unwrap();
-    assert!(fc.check().await.is_err());
-    let (ready, received) = std::sync::mpsc::channel();
-    let (finish, done) = std::sync::mpsc::channel();
-    let thread = std::thread::Builder::new()
-        .name("fc_vcpu 3".into())
-        .spawn(move || {
-            ready.send(nix::unistd::gettid().as_raw() as u32).unwrap();
-            done.recv().unwrap();
-        })
-        .unwrap();
-    let tid = received.recv().unwrap();
-    fc.pid = Some(std::process::id());
-    fc.process_start_time = Some(process::process_start_time(std::process::id()).unwrap());
-    assert_eq!(fc.get_thread_ids().await.unwrap().vcpus.get(&3), Some(&tid));
-    finish.send(()).unwrap();
-    thread.join().unwrap();
 }

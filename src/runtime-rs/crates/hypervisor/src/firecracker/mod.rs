@@ -60,6 +60,17 @@ impl Firecracker {
         let mut inner = self.inner.write().await;
         inner.set_hypervisor_config(config)
     }
+
+    /// Restore owned resources for the shim delete path, even after VMM exit.
+    /// Live recovery continues to require a matching process and FIFO readers.
+    pub async fn restore_for_cleanup(state: HypervisorState) -> Result<Self> {
+        let (exit_notify, exit_waiter) = mpsc::channel(1);
+        let inner = FcInner::restore_for_cleanup(exit_notify, state).await?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(inner)),
+            exit_waiter: Mutex::new((exit_waiter, 0)),
+        })
+    }
 }
 
 #[async_trait]
