@@ -8,6 +8,10 @@ required_tests:
   - Lint GHA workflows / run-actionlint
   - EditorConfig checker / editorconfig-checker
   - Check Cargo.toml format / Check Cargo.toml format
+  - Firecracker Rust CI / firecracker-rust-unit (ubuntu-24.04)
+  - Firecracker Rust CI / firecracker-rust-unit (ubuntu-24.04-arm)
+  - Firecracker Rust CI / firecracker-rust-kvm (configured)
+  - Firecracker Rust CI / firecracker-rust-kvm (v1.12.1)
 
 required_regexps:
   # Always required regexps

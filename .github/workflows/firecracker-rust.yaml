@@ -1,0 +1,76 @@
+name: Firecracker Rust CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: firecracker-rust-unit (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Rust checks and unit tests in a container
+        run: bash ci/run-firecracker-rust-tests.sh unit
+      - name: Jailed bind mount and rollback tests in a container
+        run: bash ci/run-firecracker-rust-tests.sh mounts
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: firecracker-rust-${{ matrix.runner }}
+          path: target/firecracker-rust/results/
+          retention-days: 14
+
+  integration:
+    name: firecracker-rust-kvm (${{ matrix.version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [configured, v1.12.1]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Load loop and device mapper modules for container root filesystems
+        run: sudo modprobe -a loop dm_mod
+      - name: Run real jailed and unjailed Firecracker containers
+        env:
+          TEST_VERSION: ${{ matrix.version }}
+        run: |
+          if [[ "${TEST_VERSION}" != configured ]]; then
+            export FC_TEST_VERSION="${TEST_VERSION}"
+          fi
+          bash ci/run-firecracker-rust-tests.sh integration
+      - name: Upload VM validation logs and provenance
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: firecracker-rust-kvm-${{ matrix.version }}
+          path: |
+            target/firecracker-rust/results/
+            target/firecracker-rust/artifacts/provenance.json
+          retention-days: 14
