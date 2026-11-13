@@ -57,7 +57,7 @@ func TestFCVFIODevicesAndPaths(t *testing.T) {
 	require.Equal(t, []string{"--resource-limit", "memlock=17179869184", "--vfio-device", "/sys/bus/pci/devices/0000:19:00.0"}, fc.vfioJailerArgs())
 	data, err := json.Marshal(fc.fcConfig)
 	require.NoError(t, err)
-	require.Contains(t, string(data), `"vfio":[{"id":"gpu0","path":"/sys/bus/pci/devices/0000:19:00.0"}]`)
+	require.Contains(t, string(data), `"vfio":[{"id":"gpu0","path":"/sys/bus/pci/devices/0000:19:00.0","pci_address":{"bus":0,"device":11,"function":0}}]`)
 	fc.fcConfig.Drives = make([]*models.Drive, 31)
 	require.Error(t, fc.resolveVFIOPaths())
 

@@ -120,14 +120,22 @@ func (fc *firecracker) resolveVFIOPaths() error {
 			return err
 		}
 	}
+	if len(fc.vfioDevices) != len(fc.fcConfig.VFIO) {
+		return fmt.Errorf("Firecracker VFIO inventory differs")
+	}
+	if fc.pciEnabled() {
+		fc.fcConfig.PCITopology = &types.FcPCITopology{Roots: []types.FcPCIRoot{{Bus: 0, LastBus: 0}}, Bridges: []types.FcPCIBridge{}}
+	}
 	for i, dev := range fc.vfioDevices {
+		address := types.FcPCIAddress{Bus: 0, Device: uint32(firstSlot + i)}
+		fc.fcConfig.VFIO[i].PCIAddress = &address
 		dev.GuestPciPath = paths[i]
 	}
 	return nil
 }
 
 // Resolve only the ancestry of explicitly allocated endpoints. Host bridges and
-// unallocated siblings are not assigned to the VM. Guest bus numbering is a VMM detail.
+// unallocated siblings are not assigned to the VM. Kata chooses all guest bus numbers.
 func (fc *firecracker) resolveStaticVFIOPaths() error {
 	return fc.resolveStaticVFIOPathsWith(filepath.EvalSymlinks)
 }

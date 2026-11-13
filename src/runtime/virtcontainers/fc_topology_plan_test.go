@@ -242,7 +242,10 @@ func TestFCConfigPublication(t *testing.T) {
 	require.NoError(t, err)
 	var actual types.FcConfig
 	require.NoError(t, json.Unmarshal(data, &actual))
-	require.Equal(t, fc.fcConfig.NUMA, actual.NUMA)
+	expected, err := json.Marshal(fc.fcConfig)
+	require.NoError(t, err)
+	require.JSONEq(t, string(expected), string(data))
+	require.Equal(t, fc.fcConfig.PCITopology, actual.PCITopology)
 	info, err := os.Lstat(fc.fcConfigPath)
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0640), info.Mode().Perm())
@@ -287,8 +290,26 @@ func TestFCPlanRecordedDualNUMAFabric(t *testing.T) {
 		addFCTestDevices(t, fc, device.ID)
 	}
 	require.NoError(t, fc.configureTopologyWith(fcTestHost{fixture.Files, fixture.Links}.source()))
-	require.Equal(t, fixture.ExpectedNUMA, *fc.fcConfig.NUMA)
+	require.Equal(t, fixture.ExpectedNUMA.Distances, fc.fcConfig.NUMA.Distances)
+	for i, node := range fixture.ExpectedNUMA.Nodes {
+		actual := fc.fcConfig.NUMA.Nodes[i]
+		actual.PCIRootSlots = nil
+		require.Equal(t, node, actual)
+	}
 	require.Len(t, fc.fcConfig.VFIO, 20)
+	require.Len(t, fc.fcConfig.PCITopology.Bridges, 38)
+	require.Equal(t, uint32(0), fc.fcConfig.PCITopology.Roots[0].Bus)
+	require.Equal(t, uint32(16), fc.fcConfig.PCITopology.Roots[0].LastBus)
+	require.Equal(t, uint32(17), fc.fcConfig.PCITopology.Roots[1].Bus)
+	require.Equal(t, uint32(39), fc.fcConfig.PCITopology.Roots[1].LastBus)
+	for _, dev := range fc.fcConfig.VFIO {
+		if dev.ID == "0000:19:00.0" {
+			require.Equal(t, uint32(3), dev.PCIAddress.Bus)
+		}
+		if dev.ID == "0000:9b:00.0" {
+			require.Equal(t, uint32(26), dev.PCIAddress.Bus)
+		}
+	}
 	for i, expected := range fixture.Devices {
 		require.Equal(t, expected.Path, fc.fcConfig.VFIO[i].Path)
 		require.Equal(t, expected.PCIPath, fc.fcConfig.VFIO[i].PCIPath)
@@ -339,4 +360,31 @@ func TestFCTopologyOptInDoesNotReadNUMAMetadata(t *testing.T) {
 	require.Nil(t, fc.guestNUMATopology())
 	require.NotEmpty(t, fc.fcConfig.VFIO[0].PCIPath)
 	require.Equal(t, "00/0d/00/01/00", fc.vfioDevices[0].GuestPciPath.String())
+}
+
+// A shared wire fixture is parsed independently by Firecracker's Rust tests.
+// Regenerate explicitly when changing the contract, then review both copies.
+func TestFCExplicitPCIContract(t *testing.T) {
+	fc, host := newFCTestPlan(t)
+	addFCTestDevices(t, fc, "0000:19:00.0", "0000:1a:00.0", "0000:9b:00.0")
+	require.NoError(t, fc.configureTopologyWith(host.source()))
+	contract := struct {
+		Topology *types.FcPCITopology `json:"pci-topology"`
+		VFIO     []types.FcVFIODevice `json:"vfio"`
+		NUMA     *types.FcNUMAConfig  `json:"numa"`
+	}{fc.fcConfig.PCITopology, fc.fcConfig.VFIO, fc.fcConfig.NUMA}
+	wire, err := json.MarshalIndent(contract, "", "  ")
+	require.NoError(t, err)
+	if output := os.Getenv("KATA_FC_PCI_FIXTURE_OUTPUT"); output != "" {
+		require.NoError(t, os.WriteFile(output, append(wire, '\n'), 0600))
+		return
+	}
+	expected, err := os.ReadFile("testdata/firecracker/explicit-pci-contract.json")
+	require.NoError(t, err)
+	require.JSONEq(t, string(expected), string(wire))
+	require.NotContains(t, string(wire), "pci_path")
+	require.NotContains(t, string(wire), "pci_root_slots")
+	require.Equal(t, &types.FcPCIAddress{Bus: 3, Device: 0}, fc.fcConfig.VFIO[0].PCIAddress)
+	require.Equal(t, &types.FcPCIAddress{Bus: 4, Device: 0}, fc.fcConfig.VFIO[1].PCIAddress)
+	require.Equal(t, &types.FcPCIAddress{Bus: 8, Device: 0}, fc.fcConfig.VFIO[2].PCIAddress)
 }

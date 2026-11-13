@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -59,6 +60,7 @@ func (fc *firecracker) configureTopologyWith(host fcTopologySource) error {
 	}
 	cfg := *fc.fcConfig
 	cfg.NUMA = nil
+	cfg.PCITopology = nil
 	cfg.VFIO = append([]types.FcVFIODevice(nil), fc.fcConfig.VFIO...)
 	for i := range cfg.VFIO {
 		cfg.VFIO[i].PCIPath = append([]uint32(nil), cfg.VFIO[i].PCIPath...)
@@ -80,7 +82,7 @@ func (fc *firecracker) configureTopologyWith(host fcTopologySource) error {
 	if err := plan.configureNUMAFrom(host.readFile); err != nil {
 		return fmt.Errorf("planning Firecracker NUMA topology: %w", err)
 	}
-	fc.fcConfig.VFIO, fc.fcConfig.NUMA = cfg.VFIO, cfg.NUMA
+	fc.fcConfig.VFIO, fc.fcConfig.NUMA, fc.fcConfig.PCITopology = cfg.VFIO, cfg.NUMA, cfg.PCITopology
 	for i, device := range plan.vfioDevices {
 		fc.vfioDevices[i].GuestPciPath = device.GuestPciPath
 	}
@@ -94,9 +96,23 @@ func (fc *firecracker) resolveVFIOPathsWith(resolve func(string) (string, error)
 	return fc.resolveVFIOPaths()
 }
 
-// Match the VMM's domain and bridge-prefix bus allocation. PCI path elements
-// are slots; a leading guest root bus is needed only by Kata's agent protocol.
+// Kata owns the guest graph: bus numbers, port types, forwarding ranges,
+// endpoint addresses, and root proximity domains are serialized before launch.
+type fcPCIPlanResult struct {
+	topology  *types.FcPCITopology
+	addresses []types.FcPCIAddress
+	paths     []types.PciPath
+}
+
 func fcGuestPCIPaths(devices []types.FcVFIODevice, numa *types.FcNUMAConfig) ([]types.PciPath, error) {
+	plan, err := fcPlanPCITopology(devices, numa)
+	if err != nil {
+		return nil, err
+	}
+	return plan.paths, nil
+}
+
+func fcPlanPCITopology(devices []types.FcVFIODevice, numa *types.FcNUMAConfig) (*fcPCIPlanResult, error) {
 	parents := map[string]bool{}
 	leaves := map[string]bool{}
 	ids := map[string]bool{}
@@ -141,13 +157,15 @@ func fcGuestPCIPaths(devices []types.FcVFIODevice, numa *types.FcNUMAConfig) ([]
 		}
 	}
 	paths := make([]types.PciPath, len(devices))
+	addresses := make([]types.FcPCIAddress, len(devices))
+	topology := &types.FcPCITopology{Roots: []types.FcPCIRoot{}, Bridges: []types.FcPCIBridge{}}
 	nextBus := 0
 	for domain := range domains {
 		if domain > 0 {
 			nextBus++
 		}
 		rootBus := nextBus
-		subtrees := map[string]bool{}
+		subtrees := map[string][]uint32{}
 		for i, dev := range devices {
 			if numa != nil {
 				owner, exists := rootDomain[dev.PCIPath[0]]
@@ -175,12 +193,63 @@ func fcGuestPCIPaths(devices []types.FcVFIODevice, numa *types.FcNUMAConfig) ([]
 				return nil, err
 			}
 			for n := 1; n < len(dev.PCIPath); n++ {
-				subtrees[fcPCIPathKey(dev.PCIPath[:n])] = true
+				subtrees[fcPCIPathKey(dev.PCIPath[:n])] = dev.PCIPath[:n]
 			}
 		}
-		nextBus += len(subtrees)
+		prefixes := make([][]uint32, 0, len(subtrees))
+		for _, prefix := range subtrees {
+			prefixes = append(prefixes, prefix)
+		}
+		sort.Slice(prefixes, func(i, j int) bool {
+			a, b := prefixes[i], prefixes[j]
+			for n := 0; n < len(a) && n < len(b); n++ {
+				if a[n] != b[n] {
+					return a[n] < b[n]
+				}
+			}
+			return len(a) < len(b)
+		})
+		buses := map[string]uint32{}
+		for _, prefix := range prefixes {
+			nextBus++
+			buses[fcPCIPathKey(prefix)] = uint32(nextBus)
+		}
+		root := types.FcPCIRoot{Bus: uint32(rootBus), LastBus: uint32(nextBus)}
+		if numa != nil {
+			id := uint32(domain)
+			root.NUMANode = &id
+		}
+		topology.Roots = append(topology.Roots, root)
+		for _, prefix := range prefixes {
+			primary := uint32(rootBus)
+			if len(prefix) > 1 {
+				primary = buses[fcPCIPathKey(prefix[:len(prefix)-1])]
+			}
+			secondary := buses[fcPCIPathKey(prefix)]
+			subordinate := secondary
+			for key, bus := range buses {
+				if strings.HasPrefix(key, fcPCIPathKey(prefix)) && bus > subordinate {
+					subordinate = bus
+				}
+			}
+			kind := "root-port"
+			if len(prefix) > 1 {
+				if len(prefix)%2 == 0 {
+					kind = "upstream-port"
+				} else {
+					kind = "downstream-port"
+				}
+			}
+			topology.Bridges = append(topology.Bridges, types.FcPCIBridge{PCIAddress: types.FcPCIAddress{Bus: primary, Device: prefix[len(prefix)-1]}, SecondaryBus: secondary, SubordinateBus: subordinate, Type: kind})
+		}
+		for i, dev := range devices {
+			if numa != nil && rootDomain[dev.PCIPath[0]] != domain {
+				continue
+			}
+			addresses[i] = types.FcPCIAddress{Bus: buses[fcPCIPathKey(dev.PCIPath[:len(dev.PCIPath)-1])], Device: dev.PCIPath[len(dev.PCIPath)-1]}
+		}
 	}
-	return paths, nil
+	return &fcPCIPlanResult{topology: topology, addresses: addresses, paths: paths}, nil
 }
 
 func fcPCIPathKey(path []uint32) string {
@@ -193,14 +262,19 @@ func fcPCIPathKey(path []uint32) string {
 }
 
 func (fc *firecracker) assignStaticGuestPaths(numa *types.FcNUMAConfig) error {
-	paths, err := fcGuestPCIPaths(fc.fcConfig.VFIO, numa)
+	plan, err := fcPlanPCITopology(fc.fcConfig.VFIO, numa)
 	if err != nil {
 		return err
 	}
 	if len(fc.vfioDevices) == 0 {
+		fc.fcConfig.PCITopology = plan.topology
+		for i := range fc.fcConfig.VFIO {
+			address := plan.addresses[i]
+			fc.fcConfig.VFIO[i].PCIAddress = &address
+		}
 		return nil // A configuration can be validated before device objects exist.
 	}
-	if len(fc.vfioDevices) != len(paths) {
+	if len(fc.vfioDevices) != len(plan.paths) {
 		return fmt.Errorf("Firecracker VFIO configuration and device inventory differ")
 	}
 	for i, dev := range fc.vfioDevices {
@@ -208,8 +282,11 @@ func (fc *firecracker) assignStaticGuestPaths(numa *types.FcNUMAConfig) error {
 			return fmt.Errorf("Firecracker VFIO device order differs for %s", dev.ID)
 		}
 	}
+	fc.fcConfig.PCITopology = plan.topology
 	for i, dev := range fc.vfioDevices {
-		dev.GuestPciPath = paths[i]
+		address := plan.addresses[i]
+		fc.fcConfig.VFIO[i].PCIAddress = &address
+		dev.GuestPciPath = plan.paths[i]
 	}
 	return nil
 }

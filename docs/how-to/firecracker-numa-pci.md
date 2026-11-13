@@ -7,7 +7,7 @@ the physical devices and supplies their CDI specifications.
 
 This integration requires the companion Firecracker NUMA/PCI implementation in
 [`llicoreweave/firecracker`, branch `havock-2250-numa-pci`](https://github.com/llicoreweave/firecracker/tree/havock-2250-numa-pci).
-It uses that implementation's `numa` and `vfio[].pci_path` configuration fields;
+It uses that implementation's `numa`, `pci-topology`, and `vfio[].pci_address` configuration fields;
 it is not compatible with an unmodified upstream Firecracker binary.
 
 ## Runtime configuration
@@ -68,8 +68,11 @@ remain available without NUMA.
    are balanced against permitted CPU capacity. Remaining RAM is apportioned
    by vCPU count in 2-MiB units, with exact CPU/RAM totals. CPU or RAM totals do
    not need to divide evenly by the domain count.
-6. Host NUMA distances, explicit vCPU affinity, RAM placement, root ownership,
-   and device paths are serialized into the VMM configuration. The runtime
+6. Kata assigns every guest root and secondary bus number, bridge primary/
+   secondary/subordinate register, PCIe port type, endpoint BDF, and PCI root
+   proximity domain. These are serialized as `pci-topology.roots`,
+   `pci-topology.bridges`, and `vfio[].pci_address`, alongside `numa` for host
+   CPU/RAM placement and distances. The runtime
    checks PCI path conflicts, root-slot capacity, the 64-bus budget, and the
    agent's ability to represent each guest root bus before publishing the plan.
 7. Kata's guest device paths and final NUMA translation use the same plan.
@@ -79,9 +82,10 @@ remain available without NUMA.
    IDs, and RAM memlock requirement from this configuration.
 
 The VMM reads `/fcConfig.json` inside the jail through `--config-file`, with
-`--enable-pci`. It validates host locality again, binds RAM before first touch,
-pins vCPUs, creates the static PCI hierarchy, and emits ACPI SRAT/SLIT and PCI
-host-bridge `_PXM` entries. The guest kernel discovers NUMA through ACPI.
+`--enable-pci`. It validates the supplied graph, binds RAM before first touch,
+pins vCPUs, creates exactly the configured PCI hierarchy, and emits ACPI SRAT/SLIT
+and the configured PCI host-bridge `_PXM` entries. Firecracker does not discover
+host PCI topology, select roots by NUMA, assign bus numbers, or infer port types. The guest kernel discovers NUMA through ACPI.
 
 Planning errors do not publish partial VMM or agent device paths. A missing
 NUMA ID, conflicting switch ownership, disjoint resource mask, insufficient
@@ -121,3 +125,23 @@ memory restrictions, missing locality, incompatible PCI paths, bus limits,
 transactional planning, atomic file replacement, and guest-agent mappings.
 The dual-NUMA H100 fabric fixture compares all 20 assigned endpoints and the
 64-vCPU/64-GiB plan against the previously verified guest configuration.
+
+## Static PCI configuration contract
+
+`pci-topology.roots[]` contains `bus`, `last_bus`, and optional `numa_node`.
+The latter is the guest index into `numa.nodes`, independent of its physical
+`host_node`. `bridges[]` contains `pci_address: {bus, device, function}`,
+`secondary_bus`, `subordinate_bus`, and `type` (`root-port`, `upstream-port`,
+`downstream-port`). Each VFIO entry supplies its exact `pci_address`.
+
+Kata retains ancestry slot paths internally for planning and agent lookup, but
+never serializes `pci_path` or `pci_root_slots`. The VMM accepts the explicit
+contract only; upgrade the runtime and VMM together. Flat PCI also uses explicit
+endpoint BDFs with a single root and an empty bridge array. Ordinary MMIO VMs
+continue to omit the PCI graph.
+
+Firecracker allocates device BAR/MMIO windows within the supplied graph. That
+allocation does not determine PCI topology or NUMA locality. The shared fixture
+`src/runtime/virtcontainers/testdata/firecracker/explicit-pci-contract.json`
+is checked against Kata's generator and independently parsed/materialized by
+the companion VMM tests. See that VMM's `docs/pci-numa.md` for a complete example.

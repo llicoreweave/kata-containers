@@ -33,7 +33,7 @@ func TestFCStaticTopologyPaths(t *testing.T) {
 	require.Equal(t, []uint32{14, 0, 0, 0}, fc.fcConfig.VFIO[2].PCIPath)
 	wire, err := json.Marshal(fc.fcConfig.VFIO[0])
 	require.NoError(t, err)
-	require.Contains(t, string(wire), `"pci_path":[13,0,1,0]`)
+	require.Contains(t, string(wire), `"pci_address":{"bus":3,"device":0,"function":0}`)
 	require.Equal(t, "00/0d/00/01/00", fc.vfioDevices[0].GuestPciPath.String())
 	ancestors["0000:19:00.0"] = "/sys/devices/pci0000:15/0000:15:01.0/0000:19:00.1"
 	require.Error(t, fc.resolveStaticVFIOPathsWith(resolve))

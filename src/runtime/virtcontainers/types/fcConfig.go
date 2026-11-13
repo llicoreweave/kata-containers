@@ -27,8 +27,9 @@ type FcConfig struct {
 	// Experimental Firecracker PR #6245 configuration, not the upstream
 	// feature/vfio branch's differently named device-passthrough API.
 	VFIO []FcVFIODevice `json:"vfio,omitempty"`
-	// Private cold-boot NUMA API; only emitted for an explicit NUMAMapping.
-	NUMA *FcNUMAConfig `json:"numa,omitempty"`
+	// Private cold-boot NUMA and explicit PCI graph APIs.
+	NUMA        *FcNUMAConfig  `json:"numa,omitempty"`
+	PCITopology *FcPCITopology `json:"pci-topology,omitempty"`
 }
 
 type FcNUMAConfig struct {
@@ -41,12 +42,39 @@ type FcNUMANode struct {
 	VCPUs        []uint32 `json:"vcpus"`
 	HostCPUs     []uint32 `json:"host_cpus"`
 	MemoryMiB    uint64   `json:"memory_mib"`
-	PCIRootSlots []uint32 `json:"pci_root_slots"`
+	PCIRootSlots []uint32 `json:"-"`
 }
 
 type FcVFIODevice struct {
 	ID   string `json:"id"`
 	Path string `json:"path"`
 	// Do not use []uint8: encoding/json serializes byte slices as base64.
-	PCIPath []uint32 `json:"pci_path,omitempty"`
+	PCIPath    []uint32      `json:"-"`
+	PCIAddress *FcPCIAddress `json:"pci_address,omitempty"`
+}
+
+// FcPCIAddress is a segment-zero guest BDF, independent of host bus numbers.
+type FcPCIAddress struct {
+	Bus      uint32 `json:"bus"`
+	Device   uint32 `json:"device"`
+	Function uint32 `json:"function"`
+}
+
+type FcPCIRoot struct {
+	Bus     uint32 `json:"bus"`
+	LastBus uint32 `json:"last_bus"`
+	// Guest proximity domain, not the physical host node ID.
+	NUMANode *uint32 `json:"numa_node,omitempty"`
+}
+
+type FcPCIBridge struct {
+	PCIAddress     FcPCIAddress `json:"pci_address"`
+	SecondaryBus   uint32       `json:"secondary_bus"`
+	SubordinateBus uint32       `json:"subordinate_bus"`
+	Type           string       `json:"type"`
+}
+
+type FcPCITopology struct {
+	Roots   []FcPCIRoot   `json:"roots"`
+	Bridges []FcPCIBridge `json:"bridges"`
 }
