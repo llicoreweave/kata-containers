@@ -175,6 +175,12 @@ func checkIgnorePCIClass(pciClass string, deviceBDF string, bitmask uint64) (boo
 	return false, nil
 }
 
+// H100 NVSwitch control functions are endpoints, despite their 0680 class.
+// Keep the upstream bridge filter for every other PCI device.
+func isH100NVSwitchEndpoint(pciClass, vendorID, deviceID string) bool {
+	return pciClass == "0x068000" && vendorID == "0x10de" && deviceID == "0x22a3"
+}
+
 func GetMajorMinorFromDevPath(devPath string) (uint32, uint32, error) {
 	fi, err := os.Stat(devPath)
 	if err != nil {
@@ -300,12 +306,12 @@ func GetAllVFIODevicesFromIOMMUGroup(device config.DeviceInfo) ([]*config.VFIODe
 			if err != nil {
 				return nil, err
 			}
-			if ignorePCIDevice {
-				continue
-			}
 			// Fetch the PCI Vendor ID and Device ID
 			vendorID := GetPCIDeviceProperty(deviceBDF, PCISysFsDevicesVendor)
 			deviceID := GetPCIDeviceProperty(deviceBDF, PCISysFsDevicesDevice)
+			if ignorePCIDevice && !isH100NVSwitchEndpoint(pciClass, vendorID, deviceID) {
+				continue
+			}
 
 			vfio = config.VFIODev{
 				ID:       id,

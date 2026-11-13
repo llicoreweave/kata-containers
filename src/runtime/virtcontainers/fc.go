@@ -162,6 +162,8 @@ type firecracker struct {
 	state  firecrackerState
 
 	jailed bool //Set to true if jailer is enabled
+
+	vfioDevices []*config.VFIODev
 }
 
 type firecrackerDevice struct {
@@ -188,6 +190,9 @@ func (fc *firecracker) truncateID(id string) string {
 }
 
 func (fc *firecracker) setConfig(config *HypervisorConfig) error {
+	if err := fcValidateVFIOConfig(config); err != nil {
+		return err
+	}
 	fc.config = *config
 
 	return nil
@@ -389,13 +394,20 @@ func (fc *firecracker) fcInit(ctx context.Context, timeout int) error {
 		if fc.netNSPath != "" {
 			args = append(args, "--netns", fc.netNSPath)
 		}
+		args = append(args, fc.vfioJailerArgs()...)
 		args = append(args, "--", "--config-file", fc.fcConfigPath)
+		if fc.pciEnabled() {
+			args = append(args, "--enable-pci")
+		}
 
 		cmd = exec.Command(fc.config.JailerPath, args...)
 	} else {
 		args = append(args,
 			"--api-sock", fc.socketPath,
 			"--config-file", fc.fcConfigPath)
+		if fc.pciEnabled() {
+			args = append(args, "--enable-pci")
+		}
 		cmd = exec.Command(fc.config.HypervisorPath, args...)
 	}
 
@@ -754,18 +766,28 @@ func (fc *firecracker) fcInitConfiguration(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	fcKernelParams = append(params, fcKernelParams...)
+	// Keep defaults per VM rather than mutating the process-wide slice. The
+	// experimental PCI runtime must not inherit pci=off or acpi=off.
+	baseParams := fcDefaultKernelParams(fc.pciEnabled())
+	baseParams = append(params, baseParams...)
 	if fc.config.Debug {
-		fcKernelParams = append(fcKernelParams, Param{"console", "ttyS0"})
+		baseParams = append(baseParams, Param{"console", "ttyS0"})
 	} else {
-		fcKernelParams = append(fcKernelParams, []Param{
+		baseParams = append(baseParams, []Param{
 			{"8250.nr_uarts", "0"},
 			// Tell agent where to send the logs
 			{"agent.log_vport", fmt.Sprintf("%d", vSockLogsPort)},
 		}...)
 	}
 
-	kernelParams := append(fc.config.KernelParams, fcKernelParams...)
+	kernelParams := append(append([]Param(nil), fc.config.KernelParams...), baseParams...)
+	if fc.pciEnabled() {
+		for _, param := range kernelParams {
+			if (param.Key == "pci" || param.Key == "acpi") && param.Value == "off" {
+				return fmt.Errorf("Firecracker VFIO requires guest PCI and ACPI; remove %s=off", param.Key)
+			}
+		}
+	}
 	strParams := SerializeParams(kernelParams, "=")
 	formattedParams := strings.Join(strParams, " ")
 	if err := fc.fcSetBootSource(ctx, kernelPath, formattedParams); err != nil {
@@ -801,6 +823,12 @@ func (fc *firecracker) fcInitConfiguration(ctx context.Context) error {
 	}
 
 	// register firecracker specificed metrics
+	if err := fc.resolveVFIOPaths(); err != nil {
+		return err
+	}
+	if err := fc.configureNUMA(); err != nil {
+		return err
+	}
 	registerFirecrackerMetrics()
 
 	return nil
@@ -845,7 +873,12 @@ func (fc *firecracker) StartVM(ctx context.Context, timeout int) error {
 		defer selinux.SetExecLabel("")
 	}
 
-	err = fc.fcInit(ctx, fcTimeout)
+	waitTimeout := fcTimeout
+	if fc.fcConfig.NUMA != nil {
+		// Large DMA-pinned NUMA guests take longer to populate/map than small microVMs.
+		waitTimeout = 300
+	}
+	err = fc.fcInit(ctx, waitTimeout)
 	if err != nil {
 		return err
 	}
@@ -1119,7 +1152,12 @@ func (fc *firecracker) AddDevice(ctx context.Context, devInfo interface{}, devTy
 	case types.HybridVSock:
 		fc.Logger().WithField("device-type-hybrid-vsock", devInfo).Info("Adding device")
 		fc.fcAddVsock(ctx, v)
+	case *config.VFIODev:
+		err = fc.fcAddVFIODevice(v)
 	default:
+		if devType == VfioDev {
+			return fmt.Errorf("unexpected Firecracker VFIO device %T", devInfo)
+		}
 		fc.Logger().WithField("unknown-device-type", devInfo).Error("Adding device")
 	}
 

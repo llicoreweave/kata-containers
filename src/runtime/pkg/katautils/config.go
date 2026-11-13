@@ -819,6 +819,21 @@ func (a agent) kernelModules() []string {
 }
 
 func newFirecrackerHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
+	return newFirecrackerHypervisorConfigWithNUMA(h, utils.GetGuestNUMANodes)
+}
+
+func newFirecrackerHypervisorConfigWithNUMA(h hypervisor, resolveNUMA func([]string) ([]types.GuestNUMANode, error)) (vc.HypervisorConfig, error) {
+	var numaNodes []types.GuestNUMANode
+	if h.NUMA || len(h.NUMAMapping) != 0 {
+		if !h.NUMA || len(h.NUMAMapping) == 0 {
+			return vc.HypervisorConfig{}, fmt.Errorf("private Firecracker NUMA requires enable_numa and an explicit numa_mapping")
+		}
+		var err error
+		numaNodes, err = resolveNUMA(h.NUMAMapping)
+		if err != nil {
+			return vc.HypervisorConfig{}, fmt.Errorf("reading explicit Firecracker NUMA mapping: %w", err)
+		}
+	}
 	hypervisor, err := h.path()
 	if err != nil {
 		return vc.HypervisorConfig{}, err
@@ -868,7 +883,11 @@ func newFirecrackerHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		HypervisorPath:        hypervisor,
 		HypervisorPathList:    h.HypervisorPathList,
 		JailerPath:            jailer,
+		GuestNUMANodes:        numaNodes,
+		NUMAMapping:           append([]string(nil), h.NUMAMapping...),
 		JailerPathList:        h.JailerPathList,
+		ColdPlugVFIO:          h.coldPlugVFIO(),
+		HotPlugVFIO:           h.hotPlugVFIO(),
 		KernelPath:            kernel,
 		InitrdPath:            initrd,
 		ImagePath:             image,

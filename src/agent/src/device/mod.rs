@@ -901,7 +901,16 @@ fn get_next_bus_from_bridge(devpath: &PathBuf) -> Result<String> {
 // provided.
 #[instrument]
 pub fn pcipath_to_sysfs(root_bus_sysfs: &str, pcipath: &pci::Path) -> Result<String> {
-    let mut bus = "0000:00".to_string();
+    // The selected host bridge need not be bus zero (e.g. a second NUMA root).
+    // Keep anonymous fixture roots compatible, but validate real pciDDDD:BB names.
+    let root_name = std::path::Path::new(root_bus_sysfs)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let mut bus = match root_name.strip_prefix("pci") {
+        Some(root) => bus_of_addr(&pci::Address::from_str(&format!("{root}:00.0"))?)?,
+        None => "0000:00".to_string(),
+    };
     let mut relpath = String::new();
 
     if pcipath.is_empty() {
@@ -2006,6 +2015,20 @@ mod tests {
 
         let relpath = pcipath_to_sysfs(rootbuspath, &path23);
         assert_eq!(relpath.unwrap(), "/0000:00:02.0/0000:01:03.0");
+    }
+
+    #[test]
+    fn test_pcipath_to_sysfs_nonzero_root_bus() {
+        let testdir = tempdir().unwrap();
+        let root = testdir.path().join("pci0000:11");
+        fs::create_dir_all(root.join("0000:11:11.0/pci_bus/0000:12")).unwrap();
+        let path = pci::Path::from_str("11/00").unwrap();
+        assert_eq!(
+            pcipath_to_sysfs(root.to_str().unwrap(), &path).unwrap(),
+            "/0000:11:11.0/0000:12:00.0"
+        );
+        let malformed = testdir.path().join("pci-invalid");
+        assert!(pcipath_to_sysfs(malformed.to_str().unwrap(), &path).is_err());
     }
 
     // We use device specific variants of this for real cases, but

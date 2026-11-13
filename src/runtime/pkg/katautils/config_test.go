@@ -23,6 +23,7 @@ import (
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/pbnjay/memory"
 	"github.com/stretchr/testify/assert"
@@ -830,6 +831,23 @@ func TestNewFirecrackerHypervisorConfig(t *testing.T) {
 	if config.TxRateLimiterMaxRate != txRateLimiterMaxRate {
 		t.Errorf("Expected value for tx rate limiter %v, got %v", txRateLimiterMaxRate, config.TxRateLimiterMaxRate)
 	}
+	assert.Empty(t, config.GuestNUMANodes)
+	assert.Empty(t, config.NUMAMapping)
+	hypervisor.NUMAMapping = []string{"0"}
+	_, err = newFirecrackerHypervisorConfig(hypervisor)
+	assert.Error(t, err, "must not silently ignore a mapping without enable_numa")
+	hypervisor.NUMA = true
+	config, err = newFirecrackerHypervisorConfigWithNUMA(hypervisor, func(mapping []string) ([]types.GuestNUMANode, error) {
+		assert.Equal(t, []string{"0"}, mapping)
+		return []types.GuestNUMANode{{HostNodes: "0", HostCPUs: "0-31"}}, nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"0"}, config.NUMAMapping)
+	assert.Len(t, config.GuestNUMANodes, 1)
+	assert.Equal(t, "0", config.GuestNUMANodes[0].HostNodes)
+	hypervisor.NUMAMapping = []string{"bad"}
+	_, err = newFirecrackerHypervisorConfig(hypervisor)
+	assert.Error(t, err, "invalid mappings must fail, not fall back to UMA")
 }
 
 func TestNewQemuHypervisorConfigImageAndInitrd(t *testing.T) {

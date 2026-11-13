@@ -2317,6 +2317,16 @@ func (s *Sandbox) AppendDevice(ctx context.Context, device api.Device) error {
 		return s.hypervisor.AddDevice(ctx, device.GetDeviceInfo().(*config.VhostUserDeviceAttrs), VhostuserDev)
 	case config.DeviceVFIO:
 		vfioDevs := device.GetDeviceInfo().([]*config.VFIODev)
+		if _, isFirecracker := s.hypervisor.(*firecracker); isFirecracker {
+			// Preserve the manager's device pointer so the experimental
+			// cold-plug backend can record the actual guest PCI path.
+			for _, dev := range vfioDevs {
+				if err := s.hypervisor.AddDevice(ctx, dev, VfioDev); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		for _, d := range vfioDevs {
 			return s.hypervisor.AddDevice(ctx, *d, VfioDev)
 		}
