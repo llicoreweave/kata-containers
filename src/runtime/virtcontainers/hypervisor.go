@@ -797,6 +797,12 @@ type HypervisorConfig struct {
 	// GuestNUMANodes defines guest NUMA topology and mapping to host NUMA nodes and CPUs.
 	GuestNUMANodes []types.GuestNUMANode
 
+	// AllocatedCPUs and AllocatedMems are populated from kubelet PodResources
+	// for the Firecracker NUMA planner, not from user annotations. Empty means
+	// that the corresponding kubelet manager supplied no explicit assignment.
+	AllocatedCPUs string
+	AllocatedMems string
+
 	// NUMAMapping is the raw user-provided NUMA mapping (TOML
 	// `numa_mapping` or the io.katacontainers.config.hypervisor.numa_mapping
 	// annotation). When empty, GuestNUMANodes was auto-derived from the

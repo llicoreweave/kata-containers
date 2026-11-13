@@ -845,6 +845,16 @@ func TestNewFirecrackerHypervisorConfig(t *testing.T) {
 	assert.Equal(t, []string{"0"}, config.NUMAMapping)
 	assert.Len(t, config.GuestNUMANodes, 1)
 	assert.Equal(t, "0", config.GuestNUMANodes[0].HostNodes)
+	hypervisor.NUMAMapping = nil
+	config, err = newFirecrackerHypervisorConfigWithNUMA(hypervisor, func(mapping []string) ([]types.GuestNUMANode, error) {
+		assert.Empty(t, mapping)
+		return []types.GuestNUMANode{{HostNodes: "0", HostCPUs: "0-3"}, {HostNodes: "2", HostCPUs: "4-7"}}, nil
+	})
+	assert.NoError(t, err)
+	assert.Empty(t, config.NUMAMapping, "automatic topology selection must remain distinguishable from an explicit mapping")
+	assert.Len(t, config.GuestNUMANodes, 2)
+	_, err = newFirecrackerHypervisorConfigWithNUMA(hypervisor, func([]string) ([]types.GuestNUMANode, error) { return nil, nil })
+	assert.Error(t, err, "enable_numa must not silently fall back to UMA")
 	hypervisor.NUMAMapping = []string{"bad"}
 	_, err = newFirecrackerHypervisorConfig(hypervisor)
 	assert.Error(t, err, "invalid mappings must fail, not fall back to UMA")

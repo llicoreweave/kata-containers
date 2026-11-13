@@ -42,6 +42,7 @@ func TestFCNUMAExplicitMapping(t *testing.T) {
 	fc.fcConfig.VFIO[1].PCIPath[0] = 13
 	require.Error(t, fc.configureNUMAWith(readNode))
 	fc.config.NUMAMapping = nil
+	fc.config.GuestNUMANodes = nil
 	fc.fcConfig.NUMA = nil
 	require.NoError(t, fc.configureNUMAWith(readNode))
 	require.Nil(t, fc.fcConfig.NUMA)

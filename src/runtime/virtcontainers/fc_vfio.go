@@ -16,22 +16,33 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
-// This test-only adapter targets Firecracker PR #6245 at
-// 5aa6bd2619d4769c824eb6d65a49bee476cb8a32. Existing MMIO runtimes stay
-// unchanged; cold_plug_vfio="root-port" opts a private runtime into PCI.
+// PCI passthrough targets the companion NUMA/PCI Firecracker implementation
+// based on PR #6245 at 5aa6bd2619d4769c824eb6d65a49bee476cb8a32.
+// Existing MMIO runtimes opt in through cold_plug_vfio.
 func (fc *firecracker) pciEnabled() bool {
 	return fc.config.ColdPlugVFIO == config.RootPort || fc.config.ColdPlugVFIO == config.SwitchPort
 }
 
 func fcValidateVFIOConfig(h *HypervisorConfig) error {
 	if h.HotPlugVFIO != "" && h.HotPlugVFIO != config.NoPort {
-		return fmt.Errorf("experimental Firecracker VFIO supports cold-plug only")
+		return fmt.Errorf("Firecracker VFIO supports cold-plug only")
 	}
 	if h.ColdPlugVFIO != "" && h.ColdPlugVFIO != config.NoPort && h.ColdPlugVFIO != config.RootPort && h.ColdPlugVFIO != config.SwitchPort {
-		return fmt.Errorf("experimental Firecracker VFIO requires cold_plug_vfio=root-port")
+		return fmt.Errorf("Firecracker VFIO requires cold_plug_vfio=root-port or switch-port")
 	}
 	if (h.ColdPlugVFIO == config.RootPort || h.ColdPlugVFIO == config.SwitchPort) && (h.VirtioMem || h.ReclaimGuestFreedMemory) {
 		return fmt.Errorf("Firecracker VFIO cannot reclaim or hotplug DMA-pinned guest memory")
+	}
+	if len(h.GuestNUMANodes) > 0 || len(h.NUMAMapping) > 0 {
+		if h.ColdPlugVFIO != config.SwitchPort {
+			return fmt.Errorf("Firecracker NUMA requires cold_plug_vfio=switch-port")
+		}
+		if len(h.GuestNUMANodes) == 0 {
+			return fmt.Errorf("Firecracker NUMA mapping has no host topology")
+		}
+		if h.HugePages {
+			return fmt.Errorf("Firecracker NUMA uses anonymous memory; hugetlb-backed memory is unsupported")
+		}
 	}
 	return nil
 }
@@ -57,9 +68,12 @@ func (fc *firecracker) fcAddVFIODevice(dev *config.VFIODev) error {
 		return fmt.Errorf("Firecracker VFIO requires a normal PCI device with valid ID and full BDF")
 	}
 	for _, existing := range fc.vfioDevices {
-		if existing.ID == dev.ID || existing.BDF == dev.BDF {
+		if existing.ID == dev.ID || strings.EqualFold(existing.BDF, dev.BDF) {
 			return fmt.Errorf("duplicate Firecracker VFIO device %s (%s)", dev.ID, dev.BDF)
 		}
+	}
+	if fc.fcConfig == nil {
+		return fmt.Errorf("Firecracker configuration is not initialized")
 	}
 	fc.vfioDevices = append(fc.vfioDevices, dev)
 	fc.fcConfig.VFIO = append(fc.fcConfig.VFIO, types.FcVFIODevice{
@@ -70,7 +84,7 @@ func (fc *firecracker) fcAddVFIODevice(dev *config.VFIODev) error {
 
 func (fc *firecracker) vfioJailerArgs() []string {
 	var args []string
-	if len(fc.vfioDevices) != 0 {
+	if fc.fcConfig != nil && len(fc.vfioDevices) != 0 {
 		args = append(args, "--resource-limit", "memlock="+strconv.FormatUint(uint64(fc.config.MemorySize)<<20, 10))
 		for _, dev := range fc.fcConfig.VFIO {
 			args = append(args, "--vfio-device", dev.Path)
@@ -92,6 +106,9 @@ func (fc *firecracker) resolveVFIOPaths() error {
 	// block disks, network interfaces, VFIO, then vsock and entropy. There
 	// is no balloon, pmem or memory-hotplug device in this Kata adapter.
 	firstSlot := 1 + len(fc.fcConfig.Drives) + len(fc.fcConfig.NetworkInterfaces)
+	if len(fc.vfioDevices) > 0 && firstSlot+len(fc.vfioDevices)+2 > 32 {
+		return fmt.Errorf("Firecracker flat PCI layout exhausts root-bus slots")
+	}
 	paths := make([]types.PciPath, len(fc.vfioDevices))
 	for i := range fc.vfioDevices {
 		slot, err := types.PciSlotFromInt(firstSlot + i)
@@ -116,6 +133,9 @@ func (fc *firecracker) resolveStaticVFIOPaths() error {
 }
 
 func (fc *firecracker) resolveStaticVFIOPathsWith(resolve func(string) (string, error)) error {
+	if len(fc.vfioDevices) != len(fc.fcConfig.VFIO) {
+		return fmt.Errorf("Firecracker VFIO configuration and device inventory differ")
+	}
 	physical := make([][]string, len(fc.vfioDevices))
 	rootSet := map[string]bool{}
 	for i, device := range fc.vfioDevices {
@@ -123,16 +143,19 @@ func (fc *firecracker) resolveStaticVFIOPathsWith(resolve func(string) (string, 
 		if err != nil {
 			return fmt.Errorf("resolving allocated PCI ancestry: %w", err)
 		}
+		if !strings.HasPrefix(resolved, "/sys/devices/") || !strings.EqualFold(filepath.Base(resolved), device.BDF) {
+			return fmt.Errorf("allocated device %s has an invalid sysfs ancestry %q", device.BDF, resolved)
+		}
 		for _, component := range strings.Split(resolved, "/") {
 			if fcVFIOBDF.MatchString(component) {
 				if !strings.HasSuffix(component, ".0") {
-					return fmt.Errorf("static topology prototype requires function zero: %s", component)
+					return fmt.Errorf("Firecracker static PCI topology requires function zero: %s", component)
 				}
 				physical[i] = append(physical[i], component)
 			}
 		}
-		if len(physical[i]) < 2 {
-			return fmt.Errorf("allocated device lacks PCI bridge ancestry: %s", device.BDF)
+		if len(physical[i]) < 2 || len(physical[i]) > 8 {
+			return fmt.Errorf("allocated device requires 2..8 PCI ancestry slots: %s", device.BDF)
 		}
 		rootSet[physical[i][0]] = true
 	}
@@ -146,7 +169,7 @@ func (fc *firecracker) resolveStaticVFIOPathsWith(resolve func(string) (string, 
 	if first+len(roots) > 32 {
 		return fmt.Errorf("static topology exhausts root-bus slots")
 	}
-	for i, device := range fc.vfioDevices {
+	for i := range fc.vfioDevices {
 		rootIndex := sort.SearchStrings(roots, physical[i][0])
 		path := []uint32{uint32(first + rootIndex)}
 		for _, component := range physical[i][1:] {
@@ -156,28 +179,8 @@ func (fc *firecracker) resolveStaticVFIOPathsWith(resolve func(string) (string, 
 			}
 			path = append(path, uint32(slot))
 		}
-		// The pinned private guest agent treats the first component of paths
-		// with >=3 elements as the PCI root-complex bus. Explicitly include
-		// bus 00 for its device-tree protocol; the VMM path has no such prefix.
-		slots := make([]types.PciSlot, len(path)+1)
-		rootBus, err := types.PciSlotFromInt(0)
-		if err != nil {
-			return err
-		}
-		slots[0] = rootBus
-		for j, number := range path {
-			slot, err := types.PciSlotFromInt(int(number))
-			if err != nil {
-				return err
-			}
-			slots[j+1] = slot
-		}
-		guestPath, err := types.PciPathFromSlots(slots...)
-		if err != nil {
-			return err
-		}
-		device.GuestPciPath = guestPath
+
 		fc.fcConfig.VFIO[i].PCIPath = path
 	}
-	return nil
+	return fc.assignStaticGuestPaths(nil)
 }

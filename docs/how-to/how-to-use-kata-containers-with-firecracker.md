@@ -2,6 +2,9 @@
 
 This document provides an overview on how to run Kata Containers with the AWS Firecracker hypervisor.
 
+For the companion NUMA/PCI Firecracker implementation, see
+[NUMA-aware PCI passthrough](firecracker-numa-pci.md).
+
 ## Introduction
 
 AWS Firecracker is an open source virtualization technology that is purpose-built for creating and managing secure, multi-tenant container and function-based services that provide serverless operational models. AWS Firecracker runs workloads in lightweight virtual machines, called `microVMs`, which combine the security and isolation properties provided by hardware virtualization technology with the speed and flexibility of Containers.

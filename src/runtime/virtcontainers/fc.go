@@ -164,6 +164,11 @@ type firecracker struct {
 	jailed bool //Set to true if jailer is enabled
 
 	vfioDevices []*config.VFIODev
+
+	// Pod resource constraints are intersected with the process's effective
+	// affinity and memory-node mask when constructing the static topology.
+	sandboxCPUs string
+	sandboxMems string
 }
 
 type firecrackerDevice struct {
@@ -823,10 +828,7 @@ func (fc *firecracker) fcInitConfiguration(ctx context.Context) error {
 	}
 
 	// register firecracker specificed metrics
-	if err := fc.resolveVFIOPaths(); err != nil {
-		return err
-	}
-	if err := fc.configureNUMA(); err != nil {
+	if err := fc.configureTopology(); err != nil {
 		return err
 	}
 	registerFirecrackerMetrics()
@@ -845,12 +847,7 @@ func (fc *firecracker) StartVM(ctx context.Context, timeout int) error {
 		return err
 	}
 
-	data, errJSON := json.MarshalIndent(fc.fcConfig, "", "\t")
-	if errJSON != nil {
-		return errJSON
-	}
-
-	if err := os.WriteFile(fc.fcConfigPath, data, 0640); err != nil {
+	if err := fc.writeConfig(); err != nil {
 		return err
 	}
 

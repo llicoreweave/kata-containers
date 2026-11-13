@@ -765,7 +765,16 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 		return nil, err
 	}
 
-	// store doesn't require hypervisor to be stored immediately
+	// Static topology planners need the sandbox's CPU/node restrictions before
+	// constructing their vCPU and memory bindings. Other backends are unchanged.
+	if planner, ok := s.hypervisor.(interface{ setSandboxResourceConstraints(string, string) }); ok {
+		cpus, mems, err := s.getSandboxCPUSet()
+		if err != nil {
+			return nil, err
+		}
+		planner.setSandboxResourceConstraints(cpus, mems)
+	}
+	// Store doesn't require hypervisor to be stored immediately.
 	if err = s.hypervisor.CreateVM(ctx, s.id, s.network, &sandboxConfig.HypervisorConfig); err != nil {
 		return nil, err
 	}
@@ -1595,6 +1604,11 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 		return s.hypervisor.StartVM(ctx, VmStartTimeout)
 	}); err != nil {
 		return err
+	}
+	if planner, ok := s.hypervisor.(interface{ guestNUMATopology() []types.GuestNUMANode }); ok {
+		// Keep guest CPU/memory translation consistent with the static VMM
+		// configuration after automatic host-domain selection and CPU pinning.
+		s.config.HypervisorConfig.GuestNUMANodes = planner.guestNUMATopology()
 	}
 
 	if caps.IsNetworkDeviceHotplugSupported() && prestartHookFunc != nil {

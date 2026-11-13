@@ -825,13 +825,16 @@ func newFirecrackerHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 func newFirecrackerHypervisorConfigWithNUMA(h hypervisor, resolveNUMA func([]string) ([]types.GuestNUMANode, error)) (vc.HypervisorConfig, error) {
 	var numaNodes []types.GuestNUMANode
 	if h.NUMA || len(h.NUMAMapping) != 0 {
-		if !h.NUMA || len(h.NUMAMapping) == 0 {
-			return vc.HypervisorConfig{}, fmt.Errorf("private Firecracker NUMA requires enable_numa and an explicit numa_mapping")
+		if !h.NUMA {
+			return vc.HypervisorConfig{}, fmt.Errorf("Firecracker numa_mapping requires enable_numa")
 		}
 		var err error
 		numaNodes, err = resolveNUMA(h.NUMAMapping)
 		if err != nil {
-			return vc.HypervisorConfig{}, fmt.Errorf("reading explicit Firecracker NUMA mapping: %w", err)
+			return vc.HypervisorConfig{}, fmt.Errorf("reading Firecracker NUMA topology: %w", err)
+		}
+		if len(numaNodes) == 0 {
+			return vc.HypervisorConfig{}, fmt.Errorf("Firecracker enable_numa requires host NUMA topology")
 		}
 	}
 	hypervisor, err := h.path()

@@ -5,8 +5,8 @@ package virtcontainers
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -15,19 +15,37 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
-// Explicit opt-in: auto-discovered GuestNUMANodes must not change older runtimes.
-func (fc *firecracker) configureNUMA() error {
-	err := fc.configureNUMAWith(func(path string) (int, error) {
-		value, err := os.ReadFile(filepath.Join(path, "numa_node"))
+// NUMA remains opt-in through enable_numa. The host node mapping can be
+// explicit, or selected here from the allocated devices and allowed resources.
+func (fc *firecracker) configureNUMAFrom(readFile func(string) ([]byte, error)) error {
+	if len(fc.config.GuestNUMANodes) == 0 && len(fc.config.NUMAMapping) == 0 {
+		return nil
+	}
+	deviceNodes := map[string]int{}
+	readNode := func(path string) (int, error) {
+		if node, ok := deviceNodes[path]; ok {
+			return node, nil
+		}
+		data, err := readFile(filepath.Join(path, "numa_node"))
 		if err != nil {
 			return 0, err
 		}
-		return strconv.Atoi(strings.TrimSpace(string(value)))
-	})
-	if err != nil || fc.fcConfig.NUMA == nil {
+		node, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || node < 0 || node >= 64 {
+			return 0, fmt.Errorf("invalid or unknown NUMA locality for %s: %q", path, strings.TrimSpace(string(data)))
+		}
+		deviceNodes[path] = node
+		return node, nil
+	}
+	nodes, err := fc.selectNUMANodes(readFile, readNode)
+	if err != nil {
 		return err
 	}
-	return fc.configureNUMADistances(os.ReadFile)
+	fc.config.GuestNUMANodes = nodes
+	if err := fc.configureNUMAWith(readNode); err != nil {
+		return err
+	}
+	return fc.configureNUMADistances(readFile)
 }
 
 func (fc *firecracker) configureNUMADistances(readFile func(string) ([]byte, error)) error {
@@ -51,6 +69,9 @@ func (fc *firecracker) configureNUMADistances(readFile func(string) ([]byte, err
 			return fmt.Errorf("reading host NUMA distance: %w", err)
 		}
 		distances := strings.Fields(string(data))
+		if len(distances) != online.Size() {
+			return fmt.Errorf("host NUMA distance row for node %d has %d columns, expected %d", node.HostNode, len(distances), online.Size())
+		}
 		for j, remote := range fc.fcConfig.NUMA.Nodes {
 			column, found := columns[remote.HostNode]
 			if !found || column >= len(distances) {
@@ -67,28 +88,39 @@ func (fc *firecracker) configureNUMADistances(readFile func(string) ([]byte, err
 }
 
 func (fc *firecracker) configureNUMAWith(deviceNode func(string) (int, error)) error {
-	if len(fc.config.NUMAMapping) == 0 {
+	if len(fc.config.NUMAMapping) == 0 && len(fc.config.GuestNUMANodes) == 0 {
 		return nil
 	}
 	if fc.config.ColdPlugVFIO != config.SwitchPort {
-		return fmt.Errorf("private Firecracker NUMA requires the static switch-port runtime")
+		return fmt.Errorf("Firecracker NUMA requires cold_plug_vfio=switch-port")
 	}
 	nodes := fc.config.GuestNUMANodes
 	count := len(nodes)
-	if count == 0 || count > 64 || fc.config.NumVCPUs()%uint32(count) != 0 || fc.config.MemorySize%uint32(2*count) != 0 {
-		return fmt.Errorf("NUMA CPU and memory totals must divide equally across explicit nodes")
+	cpus := fc.config.NumVCPUs()
+	if count == 0 || count > 64 || cpus < uint32(count) || cpus > 64 || fc.config.MemorySize%2 != 0 || fc.config.MemorySize < uint32(2*count) {
+		return fmt.Errorf("Firecracker NUMA requires 1..64 domains, at least one vCPU and 2 MiB per domain, up to 64 vCPUs, and even memory_mib")
 	}
-	perNode := fc.config.NumVCPUs() / uint32(count)
-	if perNode == 0 || fc.config.NumVCPUs() > 64 || fc.config.MemorySize == 0 {
-		return fmt.Errorf("NUMA requires 1..=64 vCPUs and nonzero memory")
+	capacities := make([]int, count)
+	for i, node := range nodes {
+		available, err := cpuset.Parse(node.HostCPUs)
+		if err != nil || available.IsEmpty() {
+			return fmt.Errorf("invalid host CPUs for NUMA domain %d", i)
+		}
+		capacities[i] = available.Size()
 	}
+	cpuCounts, err := fcDistributeVCPUs(int(cpus), capacities)
+	if err != nil {
+		return err
+	}
+	memory := fcDistributeMemory(uint64(fc.config.MemorySize), cpuCounts)
+	vcpu := uint32(0)
 	numa := &types.FcNUMAConfig{Distances: make([][]uint32, count)}
 	hostToGuest := map[int]int{}
 	usedCPUs := map[int]bool{}
 	for id, node := range nodes {
 		hostNodes, err := cpuset.Parse(node.HostNodes)
 		if err != nil || hostNodes.Size() != 1 {
-			return fmt.Errorf("one host node required per private Firecracker NUMA domain")
+			return fmt.Errorf("one host node required per Firecracker NUMA domain")
 		}
 		host := hostNodes.ToSlice()[0]
 		if host >= 64 {
@@ -99,16 +131,17 @@ func (fc *firecracker) configureNUMAWith(deviceNode func(string) (int, error)) e
 		}
 		hostToGuest[host] = id
 		cpus, err := cpuset.Parse(node.HostCPUs)
-		if err != nil || cpus.Size() < int(perNode) {
+		if err != nil || cpus.Size() < cpuCounts[id] {
 			return fmt.Errorf("insufficient CPUs for NUMA node %d", id)
 		}
-		guest := types.FcNUMANode{HostNode: uint32(host), MemoryMiB: uint64(fc.config.MemorySize) / uint64(count), PCIRootSlots: []uint32{}}
-		for vcpu, cpu := range cpus.ToSlice()[:perNode] {
+		guest := types.FcNUMANode{HostNode: uint32(host), MemoryMiB: memory[id], PCIRootSlots: []uint32{}}
+		for _, cpu := range cpus.ToSlice()[:cpuCounts[id]] {
 			if cpu >= 1024 || usedCPUs[cpu] {
 				return fmt.Errorf("invalid or duplicate NUMA host CPU %d", cpu)
 			}
 			usedCPUs[cpu] = true
-			guest.VCPUs = append(guest.VCPUs, uint32(id)*perNode+uint32(vcpu))
+			guest.VCPUs = append(guest.VCPUs, vcpu)
+			vcpu++
 			guest.HostCPUs = append(guest.HostCPUs, uint32(cpu))
 		}
 		numa.Nodes = append(numa.Nodes, guest)
@@ -141,47 +174,70 @@ func (fc *firecracker) configureNUMAWith(deviceNode func(string) (int, error)) e
 			numa.Nodes[guest].PCIRootSlots = append(numa.Nodes[guest].PCIRootSlots, root)
 		}
 	}
-	// Mirror the VMM's root-bus numbering. Each domain owns a root bus,
-	// followed by its lexically ordered bridge-prefix buses.
-	nextBus := 0
-	for id := range numa.Nodes {
-		if id != 0 {
-			nextBus++
-		}
-		rootBus := nextBus
-		parents := map[string]bool{}
-		for i, dev := range fc.fcConfig.VFIO {
-			if rootNode[dev.PCIPath[0]] != id {
-				continue
-			}
-			for n := 1; n < len(dev.PCIPath); n++ {
-				parents[fmt.Sprint(dev.PCIPath[:n])] = true
-			}
-			if i >= len(fc.vfioDevices) {
-				continue
-			} // synthetic configuration tests
-			slots := make([]types.PciSlot, len(dev.PCIPath)+1)
-			var err error
-			slots[0], err = types.PciSlotFromInt(rootBus)
-			if err != nil {
-				return err
-			}
-			for j, slot := range dev.PCIPath {
-				slots[j+1], err = types.PciSlotFromInt(int(slot))
-				if err != nil {
-					return err
-				}
-			}
-			fc.vfioDevices[i].GuestPciPath, err = types.PciPathFromSlots(slots...)
-			if err != nil {
-				return err
-			}
-		}
-		nextBus += len(parents)
-		if nextBus >= 64 {
-			return fmt.Errorf("NUMA PCI topology exhausts 64 buses")
-		}
+	if err := fc.assignStaticGuestPaths(numa); err != nil {
+		return err
+	}
+	for i := range numa.Nodes {
+		sort.Slice(numa.Nodes[i].PCIRootSlots, func(a, b int) bool { return numa.Nodes[i].PCIRootSlots[a] < numa.Nodes[i].PCIRootSlots[b] })
 	}
 	fc.fcConfig.NUMA = numa
 	return nil
+}
+
+// Give each domain one vCPU, then balance occupancy against the available
+// CPU capacity. Integer comparisons keep results deterministic without floats.
+func fcDistributeVCPUs(total int, capacities []int) ([]int, error) {
+	counts := make([]int, len(capacities))
+	capacity := 0
+	for i, available := range capacities {
+		if available < 1 {
+			return nil, fmt.Errorf("NUMA domain %d has no permitted host CPUs", i)
+		}
+		counts[i] = 1
+		capacity += available
+	}
+	if total < len(counts) || total > capacity {
+		return nil, fmt.Errorf("cannot place %d vCPUs on %d NUMA domains with %d permitted host CPUs", total, len(counts), capacity)
+	}
+	for remaining := total - len(counts); remaining > 0; remaining-- {
+		best := -1
+		for i, available := range capacities {
+			if counts[i] < available && (best < 0 || counts[i]*capacities[best] < counts[best]*available) {
+				best = i
+			}
+		}
+		counts[best]++
+	}
+	return counts, nil
+}
+
+// Reserve 2 MiB per domain, then distribute the rest proportionally to vCPUs
+// using largest remainders. The result exactly matches the VM's RAM total.
+func fcDistributeMemory(total uint64, cpus []int) []uint64 {
+	memory := make([]uint64, len(cpus))
+	weights := uint64(0)
+	for _, count := range cpus {
+		weights += uint64(count)
+	}
+	units := total/2 - uint64(len(cpus))
+	remainders := make([]uint64, len(cpus))
+	assigned := uint64(0)
+	for i, count := range cpus {
+		share := units * uint64(count)
+		memory[i] = 2 * (1 + share/weights)
+		remainders[i] = share % weights
+		assigned += memory[i]
+	}
+	for assigned < total {
+		best := 0
+		for i := range remainders {
+			if remainders[i] > remainders[best] {
+				best = i
+			}
+		}
+		memory[best] += 2
+		remainders[best] = 0
+		assigned += 2
+	}
+	return memory
 }

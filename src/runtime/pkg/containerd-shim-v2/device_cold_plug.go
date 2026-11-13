@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cpuset"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -60,10 +62,14 @@ func coldPlugDevices(ctx context.Context, s *service, ociSpec *specs.Spec) error
 
 func coldPlugWithAPI(ctx context.Context, s *service, ociSpec *specs.Spec) error {
 	ann := ociSpec.Annotations
-	devices, err := getDeviceSpec(ctx, s.config.PodResourceAPISock, ann)
+	resources, err := getPodResourceSnapshot(ctx, s.config.PodResourceAPISock, ann)
 	if err != nil {
 		return err
 	}
+	if err := s.constrainFirecrackerResources(resources); err != nil {
+		return err
+	}
+	devices := podResourceDeviceSpec(resources)
 
 	if len(devices) == 0 {
 		shimLog.WithField("pod", debugPodID(ann)).Debug("No devices found in Pod Resources, skip cold plug")
@@ -78,11 +84,9 @@ func coldPlugWithAPI(ctx context.Context, s *service, ociSpec *specs.Spec) error
 	return nil
 }
 
-// getDeviceSpec fetches the device information for the pod sandbox using
-// kubelet's pod resource api. This is necessary for cold plug because
-// the Kubelet does not pass the device information via CRI during
-// Sandbox creation.
-func getDeviceSpec(ctx context.Context, socket string, ann map[string]string) ([]string, error) {
+// getPodResourceSnapshot fetches the pod's resources before sandbox startup.
+// CRI does not include device allocations in its RunPodSandbox request.
+func getPodResourceSnapshot(ctx context.Context, socket string, ann map[string]string) (*podresourcesv1.PodResources, error) {
 	podName, podNs := getPodIdentifiers(ann)
 
 	// create dialer for unix socket
@@ -122,7 +126,10 @@ func getDeviceSpec(ctx context.Context, socket string, ann map[string]string) ([
 		return nil, fmt.Errorf("cold plug: PodResources is nil")
 	}
 
-	// Process results
+	return podRes, nil
+}
+
+func podResourceDeviceSpec(podRes *podresourcesv1.PodResources) []string {
 	var devices []string
 	for _, container := range podRes.Containers {
 		for _, d := range container.Devices {
@@ -133,7 +140,39 @@ func getDeviceSpec(ctx context.Context, socket string, ann map[string]string) ([
 		}
 	}
 
-	return devices, nil
+	return devices
+}
+
+// Keep kubelet's explicit CPUManager/MemoryManager assignments with the same
+// device snapshot used for cold plug. This does not reserve additional CPUs or
+// memory, and must not change resource behavior for other hypervisors.
+func (s *service) constrainFirecrackerResources(resources *podresourcesv1.PodResources) error {
+	if s.config.HypervisorType != vc.FirecrackerHypervisor || len(s.config.HypervisorConfig.GuestNUMANodes) == 0 {
+		return nil
+	}
+	cpus, mems := cpuset.NewCPUSet(), cpuset.NewCPUSet()
+	for _, container := range resources.Containers {
+		for _, cpu := range container.CpuIds {
+			if cpu < 0 || cpu >= 1024 {
+				return fmt.Errorf("invalid allocated Firecracker host CPU %d", cpu)
+			}
+			cpus = cpus.Union(cpuset.NewCPUSet(int(cpu)))
+		}
+		for _, memory := range container.Memory {
+			if memory.Topology == nil {
+				continue
+			}
+			for _, node := range memory.Topology.Nodes {
+				if node.ID < 0 || node.ID >= 64 {
+					return fmt.Errorf("invalid allocated Firecracker host memory node %d", node.ID)
+				}
+				mems = mems.Union(cpuset.NewCPUSet(int(node.ID)))
+			}
+		}
+	}
+	s.config.HypervisorConfig.AllocatedCPUs = cpus.String()
+	s.config.HypervisorConfig.AllocatedMems = mems.String()
+	return nil
 }
 
 // formatCDIDevIDs formats the way CDI package expects
