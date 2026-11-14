@@ -145,3 +145,24 @@ allocation does not determine PCI topology or NUMA locality. The shared fixture
 `src/runtime/virtcontainers/testdata/firecracker/explicit-pci-contract.json`
 is checked against Kata's generator and independently parsed/materialized by
 the companion VMM tests. See that VMM's `docs/pci-numa.md` for a complete example.
+
+
+## Full-fabric validation helper
+
+The optional [standalone auxiliary device plugin](../../tools/testing/firecracker-fabric-aux/README.txt)
+contains the helper used for the eight-GPU/eight-NIC validation. GPUs continue to
+use the existing `nvidia.com/gpu` allocation. Its separate auxiliary resource
+contains only NICs and NVSwitches. It is a fixed-inventory experiment and requires
+exclusive ownership of those functions, including any management-owned switches.
+
+The helper resolves current IOMMU group numbers and returns a stable CDI identity
+instead of caching per-boot VFIO paths in kubelet. Its CDI publisher validates
+identities, VFIO bindings and singleton groups before atomically writing the
+auxiliary device mapping. Host VFIO preparation remains a node-provisioning task;
+the Kata GPU attach path does not drain native NVIDIA or DCGM processes.
+
+A host reboot followed by manual asset staging passed CUDA on all eight GPUs,
+RDMA CPU-memory controls on all eight NICs, and CUDA-verified local RDMA writes
+and reads on all 64 GPU/NIC pairs. The runtime tested was `ae1e1cf` with companion
+VMM `f646783`. This validates a fresh VM boot after host reboot, not automatic
+restoration of an installation staged only on ephemeral node storage.
